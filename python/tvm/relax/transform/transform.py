@@ -284,6 +284,21 @@ def Normalize() -> tvm.ir.transform.Pass:
     return _ffi_api.Normalize()  # type: ignore
 
 
+def NormalizeGlobalVar() -> tvm.ir.transform.Pass:
+    """Possibly rename the GlobalVar in an IRModule to ensure these properties:
+
+    1. (Invariant) First ensure every public function has the same name as its "global_symbol"
+    attribute
+    2. To ensure 1., we may need to rename private functions with conflicting names;
+    3. Finally, the name of every GlobalVar is unique in the IRModule.
+
+    Returns
+    -------
+    ret: tvm.ir.transform.Pass
+    """
+    return _ffi_api.NormalizeGlobalVar()  # type: ignore
+
+
 def CanonicalizeBindings() -> tvm.ir.transform.Pass:
     """
     Canonicalizes variable definitions
@@ -543,6 +558,36 @@ def FoldConstant() -> tvm.ir.transform.Pass:
     return _ffi_api.FoldConstant()  # type: ignore
 
 
+def ExpandTupleArguments() -> tvm.ir.transform.Pass:
+    """Expand tuple arguments to internal functions
+
+    Returns
+    -------
+    ret: tvm.ir.transform.Pass
+    """
+    return _ffi_api.ExpandTupleArguments()  # type: ignore
+
+
+def RemoveUnusedParameters() -> tvm.ir.transform.Pass:
+    """Remove unused arguments to internal functions
+
+    Returns
+    -------
+    ret: tvm.ir.transform.Pass
+    """
+    return _ffi_api.RemoveUnusedParameters()  # type: ignore
+
+
+def RemoveUnusedOutputs() -> tvm.ir.transform.Pass:
+    """Remove unused outputs from internal functions
+
+    Returns
+    -------
+    ret: tvm.ir.transform.Pass
+    """
+    return _ffi_api.RemoveUnusedOutputs()  # type: ignore
+
+
 def AnnotateTIROpPattern() -> tvm.ir.transform.Pass:
     """Annotate Op Pattern Kind for TIR functions
 
@@ -647,19 +692,21 @@ class FusionPattern(Object):
     pattern: DFPattern
     annotation_patterns: Mapping[str, DFPattern]
     check: Callable[[PatternCheckContext], bool]
+    attrs_getter: Callable[[Dict[str, Expr]], Dict[str, str]]
 
     def __init__(
         self,
         name: str,
         pattern: DFPattern,
         annotation_patterns: Optional[Mapping[str, DFPattern]] = None,
-        check: Optional[Callable[[Mapping[str, Expr]], bool]] = None,
+        check: Optional[Callable[[PatternCheckContext], bool]] = None,
+        attrs_getter: Optional[Callable[[Dict[str, Expr]], Dict[str, str]]] = None,
     ):
         if annotation_patterns is None:
             annotation_patterns = {}
         self.__init_handle_by_constructor__(
-            _ffi_api.FusionPattern, name, pattern, annotation_patterns, check  # type: ignore
-        )
+            _ffi_api.FusionPattern, name, pattern, annotation_patterns, check, attrs_getter
+        )  # type: ignore
 
 
 def FuseOpsByPattern(

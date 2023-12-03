@@ -24,6 +24,7 @@
   impure external function callings, inplace mutation, etc.
 """
 import os
+import shutil
 import sys
 import tempfile
 from collections import OrderedDict
@@ -474,9 +475,15 @@ class ExternModule(Module):
                 from . import spec as _spec
                 from .op import _wrap_nested
 
-                def extern_func(*args: Tensor) -> Tensor:
+                def extern_func(
+                    *args: List[
+                        Union[_spec.Tensor, _spec.ConstInt, _spec.ConstFloat, _spec.ConstString]
+                    ]
+                ) -> Tensor:
                     spec2var = {}
                     for arg, arg_spec in zip(args, function_spec.args):
+                        if not isinstance(arg_spec, _spec.Tensor):
+                            continue
                         for value, value_spec in zip(arg.shape, arg_spec.shape):
                             if isinstance(value_spec, str):
                                 if not value_spec in spec2var:
@@ -503,10 +510,27 @@ class ExternModule(Module):
                         out_shape,  # type: ignore[arg-type]
                         func_spec_ret.dtype,
                     )
+                    relax_args = []
+                    for arg, arg_spec in zip(args, function_spec.args):
+                        if isinstance(arg_spec, _spec.Tensor):
+                            relax_args.append(arg._expr)
+                        elif isinstance(arg_spec, _spec.ConstInt):
+                            if arg_spec.dtype is None:
+                                relax_args.append(rx.PrimValue(int(arg)))
+                            else:
+                                relax_args.append(rx.PrimValue(tir.IntImm(arg_spec.dtype, arg)))
+                        elif isinstance(arg_spec, _spec.ConstFloat):
+                            if arg_spec.dtype is None:
+                                relax_args.append(rx.PrimValue(float(arg)))
+                            else:
+                                relax_args.append(rx.PrimValue(tir.FloatImm(arg_spec.dtype, arg)))
+                        elif isinstance(arg_spec, _spec.ConstString):
+                            relax_args.append(rx.StringImm(arg))
+
                     ret_tensor = _wrap_nested(
                         call_dps_packed(
                             func_name,
-                            args=RxTuple([tensor._expr for tensor in args]),
+                            args=RxTuple(relax_args),
                             out_sinfo=out_sinfo,
                         ),
                         func_name,
@@ -566,15 +590,23 @@ class SourceModule(ExternModule):
             compile_options.append("-DDMLC_USE_FOPEN64=0")
             compile_options.append("-DDMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>")
         with tempfile.TemporaryDirectory() as temp_dir:
-            source_file = os.path.join(temp_dir, f"main{source_suffix}")
-            with open(source_file, "w", encoding="utf-8") as file:
+            source_file = f"main{source_suffix}"
+            with open(
+                os.path.join(temp_dir, f"main{source_suffix}"), "w", encoding="utf-8"
+            ) as file:
                 file.write(source_code)
-            output_file = os.path.join(temp_dir, f"main{output_suffix}")
+            output_file = f"main{output_suffix}"
+            if shutil.which("ccache"):
+                ccache_env = {"CCACHE_COMPILERCHECK": "content"}
+            else:
+                ccache_env = None
             _cc.create_shared(
                 output=output_file,
                 objects=[source_file],
                 options=compile_options,
                 cc=compiler,
+                cwd=temp_dir,
+                ccache_env=ccache_env,
             )
             func_names: List[str] = []
             func_specs: List[_spec.ExternFunctionSpec] = []
@@ -583,7 +615,9 @@ class SourceModule(ExternModule):
                 func_specs.append(func_spec)
                 if func_spec.symbol is None:
                     func_spec.symbol = func_name
-            library = load_static_library(output_file, func_names=func_names)
+            library = load_static_library(
+                os.path.join(temp_dir, f"main{output_suffix}"), func_names=func_names
+            )
         module_spec = _spec.ExternModuleSpec(
             library=library,
             functions=func_specs,

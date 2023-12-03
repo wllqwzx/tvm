@@ -1996,6 +1996,163 @@ def test_fp16A_int8B_gemm_batched():
     tvm.testing.assert_allclose(out, ref, rtol=1e-2, atol=1e-2)
 
 
+def test_fp16A_int8B_gemm_batched_finegrained():
+    @I.ir_module
+    class Module:
+        @T.prim_func
+        def decode(
+            A: T.Buffer((T.int64(128), T.int64(128)), "int8"),
+            B: T.Buffer((T.int64(2), T.int64(128)), "float16"),
+            decode_1: T.Buffer((T.int64(128), T.int64(128)), "float16"),
+        ):
+            T.func_attr({"tir.noalias": T.bool(True)})
+            for i, j in T.grid(T.int64(128), T.int64(128)):
+                with T.block("decode"):
+                    v_i, v_j = T.axis.remap("SS", [i, j])
+                    T.reads(A[v_i, v_j], B[v_i // T.int64(64), v_j])
+                    T.writes(decode_1[v_i, v_j])
+                    decode_1[v_i, v_j] = T.Cast("float16", A[v_i, v_j]) * B[v_i // T.int64(64), v_j]
+
+        @T.prim_func
+        def encode(
+            A: T.Buffer((T.int64(128), T.int64(128)), "float16"),
+            w_gathered: T.Buffer((T.int64(128), T.int64(128)), "int8"),
+            compute: T.Buffer(
+                (
+                    T.int64(2),
+                    T.int64(128),
+                ),
+                "float16",
+            ),
+        ):
+            T.func_attr({"tir.noalias": T.bool(True)})
+            max_abs_value = T.alloc_buffer(
+                (
+                    T.int64(2),
+                    T.int64(128),
+                ),
+                "float16",
+            )
+            scale = T.alloc_buffer(
+                (
+                    T.int64(2),
+                    T.int64(128),
+                )
+            )
+            for i, j, k in T.grid(T.int64(2), T.int64(128), T.int64(64)):
+                with T.block("max_abs_value"):
+                    v_i, v_j, v_k = T.axis.remap("SSR", [i, j, k])
+                    T.reads(A[v_j, v_i * T.int64(64) + v_k])
+                    T.writes(max_abs_value[v_i, v_j])
+                    with T.init():
+                        max_abs_value[v_i, v_j] = T.float16(-65504)
+                    max_abs_value[v_i, v_j] = T.max(
+                        max_abs_value[v_i, v_j], T.fabs(A[v_j, v_i * T.int64(64) + v_k])
+                    )
+            for i, j in T.grid(T.int64(2), T.int64(128)):
+                with T.block("scale"):
+                    v_i, v_j = T.axis.remap("SS", [i, j])
+                    T.reads(max_abs_value[v_i, v_j])
+                    T.writes(scale[v_i, v_j])
+                    scale[v_i, v_j] = T.max(
+                        T.Cast("float32", max_abs_value[v_i, v_j]), T.float32(0.0001)
+                    ) * T.float32(0.0078125)
+            for j, i in T.grid(T.int64(128), T.int64(128)):
+                with T.block("w_gathered"):
+                    v_j, v_i = T.axis.remap("SS", [j, i])
+                    T.reads(A[v_i, v_j], scale[v_j // T.int64(64), v_i])
+                    T.writes(w_gathered[v_j, v_i])
+                    w_gathered[v_j, v_i] = T.Cast(
+                        "int8",
+                        T.min(
+                            T.max(
+                                T.round(
+                                    T.Cast("float32", A[v_i, v_j]) / scale[v_j // T.int64(64), v_i]
+                                ),
+                                T.float32(-128),
+                            ),
+                            T.float32(127),
+                        ),
+                    )
+            for i0, i1 in T.grid(T.int64(2), T.int64(128)):
+                with T.block("compute"):
+                    v_i0, v_i1 = T.axis.remap("SS", [i0, i1])
+                    T.reads(scale[v_i0, v_i1])
+                    T.writes(compute[v_i0, v_i1])
+                    compute[v_i0, v_i1] = T.Cast("float16", scale[v_i0, v_i1])
+
+        @R.function
+        def main(
+            x: R.Tensor(("b", 128, 128), dtype="float16"),
+            y: R.Tensor((128, 128), dtype="float16"),
+        ) -> R.Tensor(("b", 128, 128), dtype="float16"):
+            R.func_attr({"num_input": 1})
+            cls = Module
+            b = T.int64()
+            with R.dataflow():
+                lv = R.call_tir(
+                    cls.encode,
+                    (y,),
+                    out_sinfo=[
+                        R.Tensor((128, 128), dtype="int8"),
+                        R.Tensor((2, 128), dtype="float16"),
+                    ],
+                )
+                lv1: R.Tensor((128, 128), dtype="int8") = lv[0]
+                lv2: R.Tensor((128, 128), dtype="int8") = R.call_pure_packed(
+                    "cutlass.ft_preprocess_weight",
+                    lv1,
+                    R.prim_value(80),
+                    R.prim_value(0),
+                    sinfo_args=(R.Tensor((128, 128), dtype="int8"),),
+                )
+                lv3: R.Tensor((2, 128), dtype="float16") = lv[1]
+                lv4: R.Tensor((128, 128), dtype="int8") = R.builtin.stop_lift_params(lv2)
+                lv5: R.Tensor((2, 128), dtype="float16") = R.builtin.stop_lift_params(lv3)
+                lv6 = R.call_tir(
+                    cls.decode, (lv4, lv5), out_sinfo=R.Tensor((128, 128), dtype="float16")
+                )
+                lv1_1: R.Tensor((b, 128, 128), dtype="float16") = R.matmul(
+                    x, lv6, out_dtype="float16"
+                )
+                R.output(lv1_1)
+            return lv1_1
+
+    x_shape = (4, 128, 128)
+    y_shape = (128, 128)
+
+    mod = partition_for_cutlass(Module)
+
+    mod = relax.transform.RunCodegen(
+        {"cutlass": {"sm": 80, "find_first_valid": False}},
+    )(mod)
+
+    x = np.random.randn(*x_shape).astype("float16")
+    y = np.random.normal(0, 0.002, size=y_shape).astype("float16")
+
+    mod = relax.pipeline.get_pipeline()(mod)
+    mod = relax.transform.LiftTransformParams()(mod)
+
+    mod_transform, mod_deploy, transform_func_name = split_transform_deploy_mod(mod)
+
+    ex = relax.build(mod_transform, target="llvm")
+    vm = relax.vm.VirtualMachine(ex, tvm.cpu(0))
+
+    (packed_weight, scales,) = vm[
+        transform_func_name
+    ]((tvm.nd.array(y),))
+
+    dev = tvm.device("cuda", 0)
+    ex = relax.build(mod_deploy, target="cuda")
+    vm = relax.vm.VirtualMachine(ex, dev)
+
+    x_nd = tvm.nd.array(x, dev)
+    inp = [x_nd, packed_weight.copyto(dev), scales.copyto(dev)]
+    out = vm["main"](*inp).numpy()
+    ref = np.dot(x, y.transpose())
+    tvm.testing.assert_allclose(out, ref, rtol=1e-2, atol=1e-2)
+
+
 def test_attention_rewrite_multi_query():
     @I.ir_module
     class Module:
@@ -2042,7 +2199,9 @@ def test_attention_rewrite_multi_query():
     tvm.testing.assert_allclose(out, ref, rtol=1e-2, atol=1e-2)
 
 
-def _test_batched_var_len_attention(mod, seq_lens, num_head, num_kv_head, head_size):
+def _test_batched_var_len_attention(
+    mod, seq_lens, num_head, num_kv_head, head_size, window_size=None
+):
     if not tvm.get_global_func("tvm.contrib.thrust.sum_scan", True):
         return
 
@@ -2066,6 +2225,7 @@ def _test_batched_var_len_attention(mod, seq_lens, num_head, num_kv_head, head_s
             "BottomRight",
             "float16",
             num_kv_head=num_kv_head,
+            window_size=window_size,
         )
         batched_queries.append(np.reshape(q, [-1, hidden_size]))
         batched_keys.append(np.reshape(k, [-1, num_kv_head * head_size]))
@@ -2259,6 +2419,62 @@ def test_sliding_window():
     # ).cpu().numpy()
 
     # tvm.testing.assert_allclose(out, ref, rtol=1e-2, atol=1e-2)
+
+
+def test_batched_var_len_sliding_window():
+    @I.ir_module
+    class Module:
+        I.module_global_infos(
+            {
+                "vdevice": [
+                    I.vdevice("llvm"),
+                ]
+            }
+        )
+
+        @R.function
+        def main(
+            queries: R.Tensor(("num_tokens", 4096), dtype="float16"),
+            keys: R.Tensor(("num_tokens", 4096), dtype="float16"),
+            values: R.Tensor(("num_tokens", 4096), dtype="float16"),
+            seq_lens: R.Tensor(("num_seq",), dtype="int32"),
+        ) -> R.Tensor(("num_tokens", 4096), dtype="float16"):
+            R.func_attr({"num_input": 4})
+            cls = Module
+            num_tokens = T.int64()
+            num_seq = T.int64()
+
+            with R.dataflow():
+                # TODO(masahi): Workaround for the broken Relax cumsum op on GPU.
+                # https://github.com/apache/tvm/issues/15851
+                cumsum = R.call_dps_packed(
+                    "tvm.contrib.thrust.sum_scan", seq_lens, out_sinfo=seq_lens.struct_info
+                )
+                max_seqlen_q = R.to_vdevice(R.max(seq_lens), "llvm:0")
+                seqstart_q = R.concat([R.zeros((1,), "int32"), cumsum])
+                q = R.reshape(queries, R.shape([1, num_tokens, 128, 32]))
+                k = R.reshape(keys, R.shape([1, num_tokens, 128, 32]))
+                v = R.reshape(values, R.shape([1, num_tokens, 128, 32]))
+                attn_out = R.nn.attention_var_len(
+                    q,
+                    k,
+                    v,
+                    seqstart_q,
+                    max_seqlen_q,
+                    causal_mask="BottomRight",
+                    window_size=T.IntImm("int32", 8),
+                )
+                out = R.reshape(attn_out, R.shape([num_tokens, 4096]))
+                R.output(out)
+            return out
+
+    seq_lens = [64, 64, 64]
+    num_head = 128
+    num_kv_head = 128
+    head_size = 32
+    window_size = 8
+
+    _test_batched_var_len_attention(Module, seq_lens, num_head, num_kv_head, head_size, window_size)
 
 
 if __name__ == "__main__":

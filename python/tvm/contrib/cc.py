@@ -172,7 +172,7 @@ def create_executable(output, objects, options=None, cc=None, cwd=None, ccache_e
 
     if _is_linux_like():
         _linux_compile(output, objects, options, cc, cwd, ccache_env)
-    elif sys.platform == "win32":
+    elif _is_windows_like():
         _windows_compile(output, objects, options, cwd, ccache_env)
     else:
         raise ValueError("Unsupported platform")

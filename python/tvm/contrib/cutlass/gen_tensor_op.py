@@ -534,6 +534,7 @@ def instantiate_template(func_name, annotations, func_args):
         attrs["activation"] = annotations.get("activation", "identity")
         attrs["bias_stride"] = annotations["bias_stride"]
         attrs["M"] = annotations["M"]
+        attrs["group_size"] = annotations["group_size"]
 
         if not isinstance(attrs["M"], tvm.tir.IntImm):
             attrs["M"] = get_flattened_batch_dim(
@@ -781,6 +782,8 @@ def instantiate_template(func_name, annotations, func_args):
             and int(annotations["arch"]) >= 80
         )
 
+        # See https://github.com/Dao-AILab/flash-attention/blob/
+        # 92dd5703ecdb99aa4a4aee9817f28557907403a2/csrc/flash_attn/flash_api.cpp#L111-L116
         if "window_size" in annotations:
             assert use_flash, "Sliding-window attention is supported only by Flash Attention."
             assert (
@@ -788,17 +791,19 @@ def instantiate_template(func_name, annotations, func_args):
             ), "Sliding-window attention is only supported for causal with bottom right mask."
             attrs["window_size_left"] = int(annotations["window_size"]) - 1
             attrs["window_size_right"] = 0
+            attrs["is_causal"] = False
         else:
             if int(annotations["custom_mask_type"]) == 2:
                 attrs["window_size_left"] = attrs["num_keys"]
                 attrs["window_size_right"] = 0
+                attrs["is_causal"] = True
             else:
                 attrs["window_size_left"] = -1
                 attrs["window_size_right"] = -1
+                attrs["is_causal"] = False
 
         if use_flash:
             headers.append("flash.h")
-            attrs["is_causal"] = int(annotations["custom_mask_type"]) == 2
             attrs["num_q_heads"] = annotations["num_q_heads"]
             attrs["num_kv_heads"] = annotations["num_kv_heads"]
 

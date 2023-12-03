@@ -155,6 +155,15 @@ TVM_DLL Pass AttachGlobalSymbol();
 TVM_DLL Pass Normalize();
 
 /*!
+ * \brief Possibly rename the GlobalVar in an IRModule to ensure these properties:
+ * 1. (Invariant) First ensure every public function has the same name as its "global_symbol"
+ *    attribute;
+ * 2. To ensure 1., we may need to rename private functions with conflicting names;
+ * 3. Finally, the name of every GlobalVar is unique in the IRModule.
+ */
+TVM_DLL Pass NormalizeGlobalVar();
+
+/*!
  * \brief Simplify a Relax module by folding var bindings and match shape nodes,
  * as well as tuple indices.
  * Best used alongside constant folding and eliminating unused bindings.
@@ -266,6 +275,24 @@ TVM_DLL Pass LiftTransformParams();
  */
 TVM_DLL Pass UpdateVDevice(VDevice new_vdevice, int64_t index);
 
+/*! \brief Expand tuple arguments to internal functions
+ *
+ * \return The Pass
+ */
+TVM_DLL Pass ExpandTupleArguments();
+
+/*! \brief Remove unused parameters to internal functions
+ *
+ * \return The Pass
+ */
+TVM_DLL Pass RemoveUnusedParameters();
+
+/*! \brief Remove unused outputs from internal functions
+ *
+ * \return The Pass
+ */
+TVM_DLL Pass RemoveUnusedOutputs();
+
 /*!
  * \brief Annotate Op Pattern Kind for TIR functions, which is used in FuseOps.
  * \note It is an auto-detect pass for "unscheduled prim_funcs", the op_pattern will be
@@ -322,11 +349,20 @@ class FusionPatternNode : public Object {
    */
   Optional<PackedFunc> check;
 
+  /*!
+   * \brief The function to get attributes for fused function
+   *
+   * It should have signature
+   * Map<String, String>(const Map<String, Expr>& context)
+   */
+  Optional<PackedFunc> attrs_getter;
+
   void VisitAttrs(tvm::AttrVisitor* v) {
     v->Visit("name", &name);
     v->Visit("pattern", &pattern);
     v->Visit("annotation_patterns", &annotation_patterns);
     v->Visit("check", &check);
+    v->Visit("attrs_getter", &attrs_getter);
   }
 
   static constexpr const char* _type_key = "relax.transform.FusionPattern";
@@ -336,9 +372,10 @@ class FusionPatternNode : public Object {
 class FusionPattern : public ObjectRef {
  public:
   FusionPattern(String name, DFPattern pattern, Map<String, DFPattern> annotation_patterns,
-                Optional<PackedFunc> check);
+                Optional<PackedFunc> check, Optional<PackedFunc> attrs_getter);
 
-  FusionPattern(String name, DFPattern pattern) : FusionPattern(name, pattern, {}, NullOpt) {}
+  FusionPattern(String name, DFPattern pattern)
+      : FusionPattern(name, pattern, {}, NullOpt, NullOpt) {}
 
   TVM_DEFINE_NOTNULLABLE_OBJECT_REF_METHODS(FusionPattern, ObjectRef, FusionPatternNode);
 };
