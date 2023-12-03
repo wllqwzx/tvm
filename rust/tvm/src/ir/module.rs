@@ -104,6 +104,7 @@ impl IRModule {
         F: IntoIterator<Item = (&'a GlobalVar, &'a BaseFunc)>,
         T: IntoIterator<Item = (&'a GlobalTypeVar, &'a TypeData)>,
         A: IntoIterator<Item = (&'a TVMString, &'a ObjectRef)>,
+        G: IntoIterator<Item = (&'a TVMString, &'a Array<ObjectRef>)>,
     {
         module_new(
             Map::from_iter(funcs),
@@ -118,7 +119,12 @@ impl IRModule {
         let types = HashMap::<GlobalTypeVar, TypeData>::new();
         let attrs = HashMap::<TVMString, ObjectRef>::new();
         let global_infos = HashMap::<TVMString, Array<ObjectRef>>::new();
-        IRModule::new(funcs.iter(), types.iter(), attrs.iter(), global_infos.iter())
+        IRModule::new(
+            funcs.iter(),
+            types.iter(),
+            attrs.iter(),
+            global_infos.iter()
+        )
     }
 
     pub fn parse<N, S>(file_name: N, source: S) -> Result<IRModule>
