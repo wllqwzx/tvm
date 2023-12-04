@@ -123,7 +123,7 @@ impl IRModule {
             funcs.iter(),
             types.iter(),
             attrs.iter(),
-            global_infos.iter()
+            global_infos.iter(),
         )
     }
 
