@@ -585,7 +585,7 @@ def build(node_type) {
   }
 }
 try {
-    build('CPU-SMALL-SPOT')
+    build('CPU')
 } catch (Exception ex) {
     build('CPU-SMALL')
 }
