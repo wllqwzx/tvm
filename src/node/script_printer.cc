@@ -21,7 +21,7 @@
 #include <tvm/node/script_printer.h>
 #include <tvm/runtime/registry.h>
 
-#include <regex>
+// #include <regex>
 
 namespace tvm {
 
@@ -38,9 +38,25 @@ std::string TVMScriptPrinter::Script(const ObjectRef& node, const Optional<Print
 }
 
 bool IsIdentifier(const std::string& name) {
-  static const std::regex kValidIdentifier("^[a-zA-Z_][a-zA-Z0-9_]*$");
-  return std::regex_match(name, kValidIdentifier);
+  if (name.empty()) {
+    return false;
+  }
+  if (!std::isalpha(name[0]) && name[0] != '_') {
+    return false;
+  }
+  for (size_t i = 1; i < name.size(); ++i) {
+    if (!std::isalnum(name[i]) && name[i] != '_') {
+      return false;
+    }
+  }
+
+  return true;
 }
+
+// bool IsIdentifier(const std::string& name) {
+//   static const std::regex kValidIdentifier("^[a-zA-Z_][a-zA-Z0-9_]*$");
+//   return std::regex_match(name, kValidIdentifier);
+// }
 
 PrinterConfig::PrinterConfig(Map<String, ObjectRef> config_dict) {
   runtime::ObjectPtr<PrinterConfigNode> n = make_object<PrinterConfigNode>();

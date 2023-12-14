@@ -26,7 +26,7 @@
 #include <tvm/runtime/registry.h>
 
 #include <cstddef>
-#include <regex>
+// #include <regex>
 #include <string>
 #include <vector>
 

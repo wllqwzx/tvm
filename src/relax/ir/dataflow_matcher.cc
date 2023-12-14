@@ -36,7 +36,7 @@
 #include <cstddef>
 #include <limits>
 #include <optional>
-#include <regex>
+// #include <regex>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -557,8 +557,10 @@ bool DFPatternMatcher::VisitDFPattern_(const DataflowVarPatternNode* op, const E
 bool DFPatternMatcher::VisitDFPattern_(const GlobalVarPatternNode* op, const Expr& expr) {
   // GlobalVarPattern is not inherited from Var, so we need to handle it separately.
   if (const auto* var_node = expr.as<GlobalVarNode>()) {
-    std::regex pat{std::string(op->name_hint())};
-    return "" == op->name_hint() || std::regex_search(std::string(var_node->name_hint), pat);
+    // std::regex pat{std::string(op->name_hint())};
+    return "" == op->name_hint() ||
+           std::string(var_node->name_hint).find(std::string(op->name_hint())) != std::string::npos;
+    // return "" == op->name_hint() || std::regex_search(std::string(var_node->name_hint), pat);
   }
   return false;
 }
