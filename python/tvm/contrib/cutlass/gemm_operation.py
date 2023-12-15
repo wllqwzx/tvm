@@ -344,12 +344,7 @@ def instantiate_gemm_template(attrs):
   CHECK(status == cutlass::Status::kSuccess);
   status = gemm_op.initialize(arguments, workspace.get());
   CHECK(status == cutlass::Status::kSuccess);
-
-  auto func = tvm::runtime::Registry::Get("runtime.get_cuda_stream");
-  ICHECK(func != nullptr);
-  cudaStream_t stream = static_cast<cudaStream_t>((*func)().operator void*());
-
-  status = gemm_op(stream);
+  status = gemm_op();
   CHECK(status == cutlass::Status::kSuccess);
 """
     op_type = attrs["op_type"]
