@@ -109,8 +109,7 @@ subgraphs = graph_split(net["main"], split_config, params)
 cutlass = tvm.target.Target(
     {
         "kind": "cutlass",
-        "sm": 75,
-        # "sm": int(tvm.target.Target("cuda").arch.split("_")[1]),
+        "sm": int(tvm.target.Target("cuda").arch.split("_")[1]),
         "use_3xtf32": True,
         "split_k_slices": [1],
         "profile_all_alignments": False,
