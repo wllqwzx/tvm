@@ -342,6 +342,20 @@ PrimExpr RewriteSimplifier::Impl::VisitExpr_(const AddNode* op) {
     TVM_TRY_RECURSIVE_REWRITE(truncmod(y, c1) + x * c1, x * c1 + truncmod(y, c1));
     // floor div
     TVM_TRY_RECURSIVE_REWRITE(floormod(y, c1) + x * c1, x * c1 + floormod(y, c1));
+
+    // Simplify (x / c3) * c1 + (y % c3) / c2 => x / c2
+    // when (x - y) % c3 == 0 and c3 = c1 * c2
+    TVM_TRY_REWRITE_IF(floordiv(x, c3) * c1 + floordiv(floormod(y, c3), c2), floordiv(x, c2),
+                       // workaround to implement a two-step, stronger prover
+                       CanProveEqual(this->VisitExpr(floormod(x - y, c3).Eval()), 0) &&
+                           c1.Eval()->value * c2.Eval()->value == c3.Eval()->value);
+
+    // Simplify (z + (x / c3) * c1) + (y % c3) / c2 => z + x / c2
+    // when (x - y) % c3 == 0 and c3 = c1 * c2
+    TVM_TRY_REWRITE_IF((z + floordiv(x, c3) * c1) + floordiv(floormod(y, c3), c2),
+                       z + floordiv(x, c2),
+                       CanProveEqual(this->VisitExpr(floormod(x - y, c3).Eval()), 0) &&
+                           c1.Eval()->value * c2.Eval()->value == c3.Eval()->value);
   }
 
   // condition rules.

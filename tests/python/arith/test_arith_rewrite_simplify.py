@@ -310,6 +310,12 @@ class TestAddIndex(BaseCompare):
         TestCase(y * flm(x, 8) + 10 * flm(x, 8), flm(x, 8) * (y + 10)),
         TestCase(fld(x, 8) * 8 + flm(x, 8), x),
         TestCase(fld(flm(x, 2) + 7, 2) + fld(x, 2), fld(x + 7, 2)),
+        TestCase(fld(x * 25, 21) * 3 + fld(flm(x * 4, 21), 7), fld(x * 25, 7)),
+        TestCase(fld((x * 25 + y), 21) * 3 + fld(flm((x * 4 + y), 21), 7), fld((x * 25 + y), 7)),
+        TestCase(fld((x * 17 + y), 20) * 4 + fld(flm((y - x * 3), 20), 5), fld((x * 17 + y), 5)),
+        TestCase(
+            (z + fld((x * 25 + y), 21) * 3) + fld(flm((x * 4 + y), 21), 7), z + fld((x * 25 + y), 7)
+        ),
     )
 
 
