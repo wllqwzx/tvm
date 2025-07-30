@@ -615,10 +615,39 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                         torch_shape = node.meta["tensor_meta"].shape
                         torch_dtype = node.meta["tensor_meta"].dtype
                         break
-            else:
-                # PARAMETER or BUFFER
+            elif spec.kind is torch.export.graph_signature.InputKind.PARAMETER:
+                # Handle PARAMETER type - must be in state_dict
+                if spec.target not in exported_program.state_dict:
+                    raise ValueError(f"Parameter {spec.target} not found in state_dict")
                 torch_shape = exported_program.state_dict[spec.target].shape
                 torch_dtype = exported_program.state_dict[spec.target].dtype
+            elif spec.kind is torch.export.graph_signature.InputKind.BUFFER:
+                # Handle BUFFER type - check state_dict first, then constants
+                if spec.target in exported_program.state_dict:
+                    torch_shape = exported_program.state_dict[spec.target].shape
+                    torch_dtype = exported_program.state_dict[spec.target].dtype
+                elif spec.target in exported_program.constants:
+                    # Non-persistent buffers are stored in constants, like inv_freq in llm
+                    # See https://github.com/huggingface/transformers/pull/24998
+                    const_tensor = exported_program.constants[spec.target]
+                    torch_shape = const_tensor.shape
+                    torch_dtype = const_tensor.dtype
+                else:
+                    # Buffer not found in either state_dict or constants, check if it's used
+                    is_used = False
+                    for node in exported_program.graph.find_nodes(op="placeholder", target=spec.target):
+                        if len(node.users) > 0:
+                            is_used = True
+                            break
+                    
+                    if not is_used:
+                        print(f"Skipping unused buffer: {spec.target}")
+                        continue
+                    else:
+                        raise ValueError(f"Used buffer {spec.target} not found in state_dict or constants")
+            else:
+                # Unknown InputKind type
+                raise ValueError(f"Unknown InputKind: {spec.kind} for {spec.target}")
 
             # TODO(mshr-h): Support range constraints
             relax_shape = [
