@@ -1597,7 +1597,6 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             attn_mask = self.env[attn_mask]
             msg = "Only a float mask is supported for the attn_mask input."
             assert "float" in attn_mask.struct_info.dtype, msg
-            attn_mask = self.block_builder.normalize(attn_mask)
 
         attention_output = self.block_builder.emit(
             relax.op.nn.attention(query, key, value, bias=attn_mask, causal_mask=causal_mask)
