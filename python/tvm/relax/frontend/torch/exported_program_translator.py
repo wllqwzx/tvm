@@ -249,9 +249,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
     def _slice(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         axes = [node.args[1]]
-        begin = [node.args[2]]
-        end = [node.args[3]]
-        stride = [node.args[4] if len(node.args) > 4 else 1]
+        begin = [self._retrieve_args(node.args[2])]
+        end = [self._retrieve_args(node.args[3])]
+        stride = [self._retrieve_args(node.args[4]) if len(node.args) > 4 else 1]
         return self.block_builder.emit(relax.op.strided_slice(x, axes, begin, end, stride))
 
     def _unflatten(self, node: fx.Node) -> relax.Var:
@@ -328,6 +328,27 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 epsilon=eps,
             )
         )
+    
+    def _sym_size_int(self, node: fx.Node) -> relax.Expr:
+        x = self.env[node.args[0]]
+        idx = node.args[1]
+        
+        # Get the shape dimension
+        shape = self.shape_of(x)
+        shape_dim = shape[idx]
+        
+        # Check if the dimension is static (has a concrete value)
+        if isinstance(shape_dim, (relax.Constant, tvm.tir.IntImm)):
+            # Static case: return a constant (this gets emitted)
+            return self.block_builder.emit(relax.const(shape_dim.value, "int32"))
+        elif isinstance(shape_dim, (tvm.tir.SizeVar, tvm.tir.Var)):
+            # Dynamic case: Return PrimValue directly WITHOUT emitting
+            # PrimValue should not be emitted - it's a compile-time value
+            return relax.PrimValue(shape_dim)
+        else:
+            raise ValueError(
+                f"Unsupported shape dimension type: {type(shape_dim)} for node {node.name}"
+            )
 
     ########## Others ##########
 
@@ -411,6 +432,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             # binary
             "add.Tensor": self._binary_op(relax.op.add, operator.add),
             "add_.Tensor": self._binary_op(relax.op.add, operator.add),
+            "add": self._binary_op(relax.op.add, operator.add),
             "bitwise_or_.Scalar": self._binary_op(relax.op.bitwise_or, operator.or_),
             "bitwise_or.Scalar": self._binary_op(relax.op.bitwise_or, operator.or_),
             "bitwise_or_.Tensor": self._binary_op(relax.op.bitwise_or, operator.or_),
@@ -549,6 +571,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 relax.op.expand_dims(self.env[node.args[0]], node.args[1])
             ),
             "view.default": self._reshape,
+            "_unsafe_view.default": self._reshape,
             "reshape.default": self._reshape,
             "reshape_as.default": self._reshape_as,
             # tensor creation
@@ -594,6 +617,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             # other
             "getitem": self._getitem,
             "item.default": self._item,
+            "sym_size.int": self._sym_size_int,
         }
 
     def create_input_vars(
