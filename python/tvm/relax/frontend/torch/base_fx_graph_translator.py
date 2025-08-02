@@ -1322,9 +1322,9 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _scaled_dot_product_attention(self, node: fx.Node) -> relax.Var:
         transpose_S_H = lambda tensor: relax.op.permute_dims(tensor, [0, 2, 1, 3])
-        query = self.block_builder.normalize(transpose_S_H(self.env[node.args[0]]))
-        key = self.block_builder.normalize(transpose_S_H(self.env[node.args[1]]))
-        value = self.block_builder.normalize(transpose_S_H(self.env[node.args[2]]))
+        query = transpose_S_H(self.env[node.args[0]])
+        key = transpose_S_H(self.env[node.args[1]])
+        value = transpose_S_H(self.env[node.args[2]])
         attn_mask = node.args[3] if len(node.args) > 3 else node.kwargs.get("attn_mask", None)
         dropout_p = node.args[4] if len(node.args) > 4 else node.kwargs.get("dropout_p", 0.0)
         assert dropout_p == 0.0, "Dropout is not supported"
@@ -1335,31 +1335,12 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             attn_mask = self.env[attn_mask]
             msg = "Only a float mask is supported for the attn_mask input."
             assert "float" in attn_mask.struct_info.dtype, msg
-            attn_mask = self.block_builder.normalize(attn_mask)
 
-
-        # Ensure Q, K, V are fully normalized with proper shape information
-        query_normalized = self.block_builder.normalize(query)
-        key_normalized = self.block_builder.normalize(key)  
-        value_normalized = self.block_builder.normalize(value)
-        
-        print(f"Normalized Q/K/V struct_info:")
-        print(f"  query: {query_normalized.struct_info}")
-        print(f"  key: {key_normalized.struct_info}")
-        print(f"  value: {value_normalized.struct_info}")
-        # batch_size, seq_len, num_heads, head_size = 
-        print("Shape", key_normalized.struct_info.shape)
-        batch_size, seq_len, num_heads, head_size = key_normalized.struct_info.shape
-        query_normalized = self.block_builder.normalize(relax.op.reshape(query_normalized, (batch_size, seq_len, num_heads, head_size)))
-        # Now we can safely call attention with properly normalized tensors
-        attention_result = self.block_builder.emit(
-            relax.op.nn.attention(query_normalized, key_normalized, value_normalized, bias=attn_mask, causal_mask=causal_mask)
+        return self.block_builder.emit(
+            transpose_S_H(
+                relax.op.nn.attention(query, key, value, bias=attn_mask, causal_mask=causal_mask)
+            )
         )
-        
-        return self.block_builder.emit(transpose_S_H(attention_result))
-  
-                
- 
 
     def _unbind(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
