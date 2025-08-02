@@ -465,10 +465,10 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                         result_expr = lhs.value // rhs.value  # Use floor division for integer expressions
                     else:
                         # For other operations, fall back to runtime calculation
-                        return self.block_builder.emit(op(lhs, rhs))
+                        return self.block_builder.normalize(op(lhs, rhs))
                     
                     # Return PrimValue with the computed expression
-                    return relax.PrimValue(result_expr)
+                    return self.block_builder.normalize(relax.PrimValue(result_expr))
                 else:
                     # Regular runtime calculation
                     return self.block_builder.emit(op(lhs, rhs))
@@ -1335,24 +1335,31 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             attn_mask = self.env[attn_mask]
             msg = "Only a float mask is supported for the attn_mask input."
             assert "float" in attn_mask.struct_info.dtype, msg
-            
-            # Ensure attn_mask has 4 dimensions [batch, heads, seq_len, seq_len]
-            attn_mask_shape = self.shape_of(attn_mask)
-            if len(attn_mask_shape) == 2:
-                # Expand 2D mask to 4D: [seq_len, seq_len] -> [1, 1, seq_len, seq_len]
-                attn_mask = self.block_builder.emit(relax.op.expand_dims(attn_mask, axis=0))
-                attn_mask = self.block_builder.emit(relax.op.expand_dims(attn_mask, axis=0))
-            elif len(attn_mask_shape) == 3:
-                # Expand 3D mask to 4D: [batch, seq_len, seq_len] -> [batch, 1, seq_len, seq_len]
-                attn_mask = self.block_builder.emit(relax.op.expand_dims(attn_mask, axis=1))
-            # 4D mask is already correct
             attn_mask = self.block_builder.normalize(attn_mask)
 
-        return self.block_builder.emit(
-            transpose_S_H(
-                relax.op.nn.attention(query, key, value, bias=attn_mask, causal_mask=causal_mask)
-            )
+
+        # Ensure Q, K, V are fully normalized with proper shape information
+        query_normalized = self.block_builder.normalize(query)
+        key_normalized = self.block_builder.normalize(key)  
+        value_normalized = self.block_builder.normalize(value)
+        
+        print(f"Normalized Q/K/V struct_info:")
+        print(f"  query: {query_normalized.struct_info}")
+        print(f"  key: {key_normalized.struct_info}")
+        print(f"  value: {value_normalized.struct_info}")
+        # batch_size, seq_len, num_heads, head_size = 
+        print("Shape", key_normalized.struct_info.shape)
+        batch_size, seq_len, num_heads, head_size = key_normalized.struct_info.shape
+        query_normalized = self.block_builder.normalize(relax.op.reshape(query_normalized, (batch_size, seq_len, num_heads, head_size)))
+        # Now we can safely call attention with properly normalized tensors
+        attention_result = self.block_builder.emit(
+            relax.op.nn.attention(query_normalized, key_normalized, value_normalized, bias=attn_mask, causal_mask=causal_mask)
         )
+        
+        return self.block_builder.emit(transpose_S_H(attention_result))
+  
+                
+ 
 
     def _unbind(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
