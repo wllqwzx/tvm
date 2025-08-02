@@ -247,11 +247,38 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         return self.block_builder.emit(relax.op.take(x, index, dim))
 
     def _slice(self, node: fx.Node) -> relax.Var:
+        import numpy as np
+        
         x = self.env[node.args[0]]
         axes = [node.args[1]]
-        begin = [self._retrieve_args(node.args[2])]
-        end = [self._retrieve_args(node.args[3])]
+        begin_raw = self._retrieve_args(node.args[2])
+        end_raw = self._retrieve_args(node.args[3])
         stride = [self._retrieve_args(node.args[4]) if len(node.args) > 4 else 1]
+        # TODO: Should have better solution for symbolic slice
+        
+        # Get tensor shape info for the axis
+        axis = axes[0]
+        x_shape = self.shape_of(x)
+        if axis < 0:
+            axis += len(x_shape)
+        axis_shape = x_shape[axis]
+        
+        # Process begin - use as-is
+        begin = [begin_raw]
+            
+        # Process end - handle int64 max values and check if axis is symbolic
+        if end_raw == np.iinfo(np.int64).max:
+            # Check if the axis dimension is symbolic
+            if isinstance(axis_shape, (tvm.tir.SizeVar, tvm.tir.Var)):
+                # For symbolic shapes, use the symbolic dimension directly
+                end = [axis_shape]
+            else:
+                # For concrete shapes, use the actual size
+                end = [axis_shape]
+        else:
+            # Use the provided end value as-is
+            end = [end_raw]
+            
         return self.block_builder.emit(relax.op.strided_slice(x, axes, begin, end, stride))
 
     def _unflatten(self, node: fx.Node) -> relax.Var:
