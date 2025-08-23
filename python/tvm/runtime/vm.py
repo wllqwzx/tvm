@@ -205,6 +205,8 @@ class VirtualMachine(object):
 
         if isinstance(arg, Object):
             cargs.append(arg)
+        elif isinstance(arg, tvm.ffi.Shape):
+            cargs.append(arg)
         elif isinstance(arg, np.ndarray):
             nd_arr = tvm.nd.array(arg, device=tvm.cpu(0))
             cargs.append(nd_arr)
