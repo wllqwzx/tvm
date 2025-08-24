@@ -1175,6 +1175,20 @@ def test_set_input_tuple(exec_mode):
     vm.invoke_stateful("main")
 
 
+def test_set_input_shape(exec_mode):
+    @tvm.script.ir_module
+    class MyMod:
+        @R.function
+        def main(x: R.Shape(["m"])):
+            return 0
+
+    temp = utils.tempdir()
+    vm, _ = make_vm(MyMod, exec_mode, temp)
+    x = tvm.runtime.ShapeTuple([1])
+    vm.set_input("main", x)
+    vm.invoke_stateful("main")
+
+
 def save_function_kwargs_trial(vm: relax.VirtualMachine, device: tvm.runtime.Device) -> None:
     # just checking that we can use kwargs for the args when saving a function
     a = tvm.runtime.tensor(np.random.rand(32, 32).astype("float32"), device)
