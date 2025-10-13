@@ -3162,3 +3162,274 @@ def _compact_kv_copy_cpu(num_heads, head_dim, dtype, page_size: int = 16):
                             ]
 
     return compact_kv_copy_cpu
+
+
+# =====================================================
+# Simple Non-Paged KV Cache Implementation
+# =====================================================
+
+
+class SimpleKVCache(Object):
+    """Simple non-paged KV cache for edge-side inference.
+
+    Unlike PagedKVCache which uses complex paging for memory efficiency in server scenarios,
+    SimpleKVCache uses contiguous memory allocation for simpler management and better
+    performance on edge devices where memory management complexity is not justified.
+
+    This implementation is optimized for single-sequence inference with fixed maximum length,
+    which is the typical use case for edge devices.
+    """
+
+    extern_mods: List[tvm.runtime.Module] = []
+
+    def attention_with_fused_qkv(
+        self,
+        layer_id: int,
+        qkv: Tensor,
+        num_qo_heads: int,
+        sm_scale: float,
+    ) -> Tensor:
+        """Compute attention with the given fused q/k/v data and cached k/v data."""
+        # pylint: disable=protected-access
+        b, s, _, d = qkv._expr.struct_info.shape
+        qkv = qkv.reshape(b * s, qkv.shape[2], d)
+        return Tensor(
+            _expr=rx.BlockBuilder.current().emit(
+                rx.call_dps_packed(
+                    "vm.builtin.attention_kv_cache_attention_with_fused_qkv_simple",
+                    [
+                        self._expr,
+                        rx.PrimValue(layer_id),
+                        rx.PrimValue(sm_scale),
+                        qkv._expr,
+                    ],
+                    out_sinfo=rx.TensorStructInfo((b * s, num_qo_heads, d), qkv.dtype),
+                )
+            )
+        ).reshape(b, s, num_qo_heads, d)
+
+    def get_query_positions(self, total_length: tir.PrimExpr) -> Tensor:
+        """Get the in-sequence positions of each slot in the query."""
+        return Tensor(
+            _expr=rx.BlockBuilder.current().emit(
+                rx.call_pure_packed(
+                    "vm.builtin.simple_kv_cache_get_query_positions",
+                    self._expr,
+                    sinfo_args=rx.TensorStructInfo((total_length,), "int32"),
+                )
+            )
+        )
+
+
+def _simple_kv_cache_append(num_key_value_heads, head_dim, dtype):
+    """Return the TIR function that appends new k/v data to SimpleKVCache."""
+
+    @T.prim_func
+    def tir_simple_kv_cache_append(
+        var_cache: T.handle,
+        var_k_data: T.handle,
+        var_v_data: T.handle,
+        var_batch_seq_ind: T.handle,
+        var_seq_idx: T.handle,
+        var_seq_lens: T.handle,
+    ):
+        T.func_attr({"tir.noalias": True})
+        batch_size = T.SizeVar("batch_size", "int32")
+        total_len = T.SizeVar("total_len", "int64")
+        max_seq_len = T.SizeVar("max_seq_len", "int64")
+
+        cache = T.match_buffer(
+            var_cache, (batch_size, max_seq_len, 2, num_key_value_heads, head_dim), dtype
+        )
+        k_data = T.match_buffer(var_k_data, (total_len, num_key_value_heads, head_dim), dtype)
+        v_data = T.match_buffer(var_v_data, (total_len, num_key_value_heads, head_dim), dtype)
+        seq_idx = T.match_buffer(var_seq_idx, (batch_size,), "int64")
+        cur_seq_lens = T.match_buffer(var_seq_lens, (batch_size,), "int64")
+        batch_seq_ind = T.match_buffer(var_batch_seq_ind, (batch_size + 1,), "int64")
+
+        for b, h, d in T.grid(batch_size, num_key_value_heads, head_dim):
+            seq_len = batch_seq_ind[b + 1] - batch_seq_ind[b]
+            for pos in T.serial(seq_len):
+                with T.block("k_append"):
+                    cache[seq_idx[b], cur_seq_lens[b] - seq_len + pos, 0, h, d] = k_data[
+                        batch_seq_ind[b] + pos, h, d
+                    ]
+                with T.block("v_append"):
+                    cache[seq_idx[b], cur_seq_lens[b] - seq_len + pos, 1, h, d] = v_data[
+                        batch_seq_ind[b] + pos, h, d
+                    ]
+
+    return tir_simple_kv_cache_append
+
+
+def _simple_attention_cpu(
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    dtype,
+):
+    """Simple attention computation."""
+    group_size = num_qo_heads // num_kv_heads
+
+    @T.prim_func
+    def simple_attention_cpu(
+        var_q: T.handle,
+        var_cache: T.handle,
+        var_batch_seq_ind: T.handle,
+        var_cur_seq_idx: T.handle,
+        var_kv_seq_lens: T.handle,
+        var_output: T.handle,
+        sm_scale: T.float32,
+        causal: T.int32,
+    ):
+        T.func_attr({"tir.is_scheduled": True})
+        batch_size = T.int32(is_size_var=True)
+        total_seq_len = T.int32(is_size_var=True)
+        max_seq_len = T.int32(is_size_var=True)
+
+        q = T.match_buffer(var_q, (total_seq_len, num_qo_heads, head_dim), dtype)
+        cache = T.match_buffer(
+            var_cache, (batch_size, max_seq_len, 2, num_kv_heads, head_dim), dtype
+        )
+        batch_seq_ind = T.match_buffer(var_batch_seq_ind, (batch_size + 1,), "int64")
+        cur_seq_idx = T.match_buffer(var_cur_seq_idx, (batch_size,), "int64")
+        kv_seq_lens = T.match_buffer(var_kv_seq_lens, (batch_size,), "int64")
+        output = T.match_buffer(var_output, (total_seq_len, num_qo_heads, head_dim), dtype)
+
+        for b_idx, h_qo_idx in T.grid(batch_size, num_qo_heads):
+            with T.block("simple_attention_block"):
+                vb, vh_qo = T.axis.remap("SS", [b_idx, h_qo_idx])
+
+                # Temporary buffers
+                q_local = T.alloc_buffer((head_dim,), dtype)
+                k_local = T.alloc_buffer((head_dim,), dtype)
+                v_local = T.alloc_buffer((head_dim,), dtype)
+                o_local = T.alloc_buffer((head_dim,), dtype)
+
+                for vqo_s in T.serial(batch_seq_ind[vb + 1] - batch_seq_ind[vb]):
+                    S = T.alloc_buffer((1,), dtype)
+                    D = T.alloc_buffer((1,), dtype)
+                    M = T.alloc_buffer((1,), dtype)
+                    M_new = T.alloc_buffer((1,), dtype)
+                    factor1 = T.alloc_buffer((1,), dtype)
+                    factor2 = T.alloc_buffer((1,), dtype)
+
+                    # init M, D
+                    M[0] = -5e4
+                    D[0] = 0.0
+                    S[0] = 0.0
+
+                    vcur_qo_s = batch_seq_ind[vb] + vqo_s
+                    # load q and init o_local
+                    for vd in T.serial(head_dim):
+                        q_local[vd] = q[vcur_qo_s, vh_qo, vd]
+                        o_local[vd] = 0.0
+
+                    for vkv_s in T.serial(kv_seq_lens[vb]):
+                        # Apply causal masking: when causal > 0, mask future positions
+                        # For causal attention: current query position (vqo_s) can only attend to
+                        # key positions up to and including its own position (vkv_s <= vqo_s)
+                        if T.if_then_else(causal > 0, vkv_s <= vqo_s, True):
+                            # init S
+                            S[0] = 0.0
+                            # load k,v
+                            for vd in T.serial(head_dim):
+                                k_local[vd] = cache[
+                                    cur_seq_idx[vb], vkv_s, 0, vh_qo // group_size, vd
+                                ]
+                                v_local[vd] = cache[
+                                    cur_seq_idx[vb], vkv_s, 1, vh_qo // group_size, vd
+                                ]
+                                S[0] += q_local[vd] * k_local[vd]
+
+                            S[0] *= sm_scale
+                            M_new[0] = T.max(M[0], S[0])
+                            factor1[0] = T.exp(M[0] - M_new[0])
+                            factor2[0] = T.exp(S[0] - M_new[0])
+                            D[0] = D[0] * factor1[0] + factor2[0]
+                            M[0] = M_new[0]
+
+                            for vd in T.serial(head_dim):
+                                o_local[vd] = o_local[vd] * factor1[0] + factor2[0] * v_local[vd]
+                    for vd in T.serial(head_dim):
+                        output[vcur_qo_s, vh_qo, vd] = o_local[vd] / D[0]
+
+    return simple_attention_cpu
+
+
+class TIRSimpleKVCache(SimpleKVCache):
+    """Simple KV cache implementation using TIR kernels."""
+
+    def __init__(
+        self,
+        max_batch_size: tir.Var,
+        max_seq_len: tir.Var,
+        num_hidden_layers: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        head_dim: int,
+        rope_mode: RopeMode,
+        rope_scale: int,
+        rope_theta: int,
+        rope_scaling: Dict[str, Any],
+        rope_ext_factors: rx.Expr,
+        rotary_dim: int,
+        dtype: str,
+        target: Target,
+        name: str = "simple_kv_cache",
+    ) -> None:
+        """Create a simple KV cache object with TIR kernels."""
+
+        bb = rx.BlockBuilder.current()
+
+        # Generate required TIR functions - both prefill and decode
+        append_func = bb.add_func(
+            _simple_kv_cache_append(num_key_value_heads, head_dim, dtype), "simple_kv_cache_append"
+        )
+        attention_prefill_func = bb.add_func(
+            _simple_attention_cpu(num_key_value_heads, num_attention_heads, head_dim, dtype),
+            "simple_attention_prefill",
+        )
+        attention_decode_func = bb.add_func(
+            _simple_attention_cpu(num_key_value_heads, num_attention_heads, head_dim, dtype),
+            "simple_attention_decode",
+        )
+        split_rotary_func = bb.add_func(
+            llama_rope_with_position_map(
+                rope_theta,
+                rope_scale,
+                head_dim,
+                num_attention_heads,
+                num_key_value_heads,
+                dtype,
+                rope_scaling,
+                rotary_dim,
+            ),
+            "split_rotary",
+        )
+
+        args = [
+            rx.ShapeExpr([max_batch_size, max_seq_len]),
+            rx.PrimValue(num_hidden_layers),
+            rx.PrimValue(num_attention_heads),
+            rx.PrimValue(num_key_value_heads),
+            rx.PrimValue(head_dim),
+            rx.PrimValue(rope_mode),
+            rx.PrimValue(rope_scale),
+            rx.PrimValue(rope_theta),
+            rope_ext_factors,
+            rx.op.zeros((), dtype),
+            append_func,
+            attention_prefill_func,
+            attention_decode_func,
+            split_rotary_func,
+        ]
+
+        super().__init__(
+            _expr=rx.call_pure_packed(
+                "vm.builtin.simple_attention_kv_cache_create",
+                *args,
+                sinfo_args=rx.ObjectStructInfo(),
+            ),
+            _name=name,
+        )
