@@ -308,8 +308,8 @@ void SimpleAttentionKVCacheObj::BeginForward(const IntTuple& seq_ids,
   cur_seq_idx_device_.CopyFromBytes(cur_seq_idx_host_.data(), cur_batch_size_ * sizeof(int64_t));
   cur_seq_lens_device_.CopyFromBytes(cur_seq_lens_host_.data(), cur_batch_size_ * sizeof(int64_t));
   // Copy query positions to device
-  cur_query_positions_ = NDArray::Empty({static_cast<int32_t>(q_positions.size())},
-                                        dtype_aux_int32_, DLDevice{kDLCPU, 0});
+  cur_query_positions_ =
+      NDArray::Empty({static_cast<int32_t>(q_positions.size())}, dtype_aux_int32_, device_);
   cur_query_positions_.CopyFromBytes(q_positions.data(), q_positions.size() * sizeof(int32_t));
 }
 
@@ -360,8 +360,13 @@ void SimpleAttentionKVCacheObj::AttentionWithFusedQKV(int64_t layer_id, NDArray 
   // Prefill: causal = 0 (no causal masking for initial prompt processing)
   // Decode: causal = 1 (causal masking for autoregressive generation)
   int32_t causal = (current_phase_ == ForwardPhase::kDecode) ? 0 : 1;
+  // Calculate the maximum query length in the batch
+  int64_t max_query_len = 0;
+  for (int i = 0; i < cur_batch_size_; ++i) {
+    max_query_len = std::max(max_query_len, batch_seq_ind_host_[i + 1] - batch_seq_ind_host_[i]);
+  }
   attention_func(q_view, cache_[layer_id], batch_seq_ind_device_, cur_seq_idx_device_,
-                 cur_seq_lens_device_, o_data, sm_scale, causal);
+                 cur_seq_lens_device_, o_data, sm_scale, max_query_len, causal);
 }
 
 void SimpleAttentionKVCacheObj::SelfAttention(int64_t layer_id, NDArray q_data, NDArray k_data,

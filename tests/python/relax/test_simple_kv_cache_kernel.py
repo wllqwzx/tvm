@@ -108,6 +108,12 @@ def run_simple_attention_cpu_tir(
     q_tvm = tvm.nd.array(q)
     kvcache_tvm = tvm.nd.array(kvcache)
     qo_seq_lens_tvm = tvm.nd.array(qo_seq_lens)
+    max_qo_seq_len = 0
+    for i in range(qo_seq_lens.shape[0] - 1):
+        seq_len = qo_seq_lens[i + 1] - qo_seq_lens[i]
+        if seq_len > max_qo_seq_len:
+            max_qo_seq_len = seq_len
+    max_qo_seq_len = int(max_qo_seq_len)
     kv_seq_lens_tvm = tvm.nd.array(kv_seq_lens)
     cur_seq_idx = tvm.nd.array(np.array(list(range(kv_seq_lens.shape[0]))).astype("int64"))
     output_tvm = tvm.nd.array(output)
@@ -119,6 +125,7 @@ def run_simple_attention_cpu_tir(
         kv_seq_lens_tvm,
         output_tvm,
         sm_scale,
+        max_qo_seq_len,
         0,
     )
     return output_tvm.numpy()
