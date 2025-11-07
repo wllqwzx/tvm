@@ -3281,6 +3281,7 @@ def _simple_attention_cpu(
         var_kv_seq_lens: T.handle,
         var_output: T.handle,
         sm_scale: T.float32,
+        max_query_len: T.int64, # not used but kept for signature consistency
         causal: T.int32,
     ):
         T.func_attr({"tir.is_scheduled": True})
