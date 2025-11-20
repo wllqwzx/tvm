@@ -26,7 +26,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/logging.h>
-#include <tvm/runtime/ndarray.h>
+#include <tvm/runtime/tensor.h>
 
 #include <algorithm>
 #include <numeric>
@@ -41,7 +41,7 @@ namespace vm {
 SimpleAttentionKVCacheObj::SimpleAttentionKVCacheObj(
     int64_t max_batch_size, int64_t max_seq_len, int64_t num_layers, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t head_dim, RoPEMode rope_mode, double rotary_scale,
-    double rotary_theta, Optional<NDArray> rope_ext_factors, DLDataType dtype, Device device,
+    double rotary_theta, ffi::Optional<Tensor> rope_ext_factors, DLDataType dtype, Device device,
     ffi::Function f_append_kv, ffi::Function f_attention_prefill, ffi::Function f_attention_decode,
     ffi::Function f_split_rotary)
     : max_batch_size_(max_batch_size),
@@ -65,23 +65,23 @@ SimpleAttentionKVCacheObj::SimpleAttentionKVCacheObj(
   // Initialize cache storage
   cache_.reserve(num_layers);
   for (int i = 0; i < num_layers; ++i) {
-    cache_.push_back(NDArray::Empty({max_batch_size_, max_seq_len_, 2, num_kv_heads_, head_dim_},
-                                    dtype, device));
+    cache_.push_back(Tensor::Empty({max_batch_size_, max_seq_len_, 2, num_kv_heads_, head_dim_},
+                                   dtype, device));
   }
 
   // Initialize sequence management
   cur_seq_lens_host_.resize(max_batch_size_, 0);
 
   // Initialize query positions
-  cur_query_positions_ = NDArray::Empty({max_seq_len_}, dtype_aux_int64_, device);
+  cur_query_positions_ = Tensor::Empty({max_seq_len_}, dtype_aux_int64_, device);
 
   // Init temporary buffers
   q_data_tmp_ =
-      NDArray::Empty({max_seq_len_ * max_batch_size_, num_qo_heads_, head_dim_}, dtype, device_);
+      Tensor::Empty({max_seq_len_ * max_batch_size_, num_qo_heads_, head_dim_}, dtype, device_);
   k_data_tmp_ =
-      NDArray::Empty({max_seq_len_ * max_batch_size_, num_kv_heads_, head_dim_}, dtype, device_);
+      Tensor::Empty({max_seq_len_ * max_batch_size_, num_kv_heads_, head_dim_}, dtype, device_);
   v_data_tmp_ =
-      NDArray::Empty({max_seq_len_ * max_batch_size_, num_kv_heads_, head_dim_}, dtype, device_);
+      Tensor::Empty({max_seq_len_ * max_batch_size_, num_kv_heads_, head_dim_}, dtype, device_);
 }
 
 void SimpleAttentionKVCacheObj::Clear() {
@@ -128,11 +128,11 @@ void SimpleAttentionKVCacheObj::RemoveSequence(int64_t seq_id) {
 
       // Copy cache data for all layers
       for (int layer = 0; layer < num_layers_; ++layer) {
-        NDArray src_view = cache_[layer].CreateView(
+        Tensor src_view = cache_[layer].CreateView(
             {1, max_seq_len_, 2, num_kv_heads_, head_dim_}, cache_[layer]->dtype,
             (cur_batch_size_ - 1) * max_seq_len_ * 2 * num_kv_heads_ * head_dim_ *
                 cache_[layer].DataType().bytes());
-        NDArray dst_view = cache_[layer].CreateView(
+        Tensor dst_view = cache_[layer].CreateView(
             {1, max_seq_len_, 2, num_kv_heads_, head_dim_}, cache_[layer]->dtype,
             seq_idx * max_seq_len_ * 2 * num_kv_heads_ * head_dim_ *
                 cache_[layer].DataType().bytes());
@@ -179,12 +179,12 @@ void SimpleAttentionKVCacheObj::ForkSequence(int64_t parent_seq_id, int64_t chil
           for (int dim = 0; dim < head_dim_; ++dim) {
             // Copy from parent[parent_idx, pos, kv, head, dim] to child[cur_batch_size_, pos, kv,
             // head, dim]
-            NDArray parent_view = cache_[layer].CreateView(
+            Tensor parent_view = cache_[layer].CreateView(
                 {1}, cache_[layer]->dtype,
                 ((parent_idx * max_seq_len_ + pos) * 2 + kv) * num_kv_heads_ * head_dim_ *
                         cache_[layer].DataType().bytes() +
                     (head * head_dim_ + dim) * cache_[layer].DataType().bytes());
-            NDArray child_view = cache_[layer].CreateView(
+            Tensor child_view = cache_[layer].CreateView(
                 {1}, cache_[layer]->dtype,
                 ((cur_batch_size_ * max_seq_len_ + pos) * 2 + kv) * num_kv_heads_ * head_dim_ *
                         cache_[layer].DataType().bytes() +
@@ -263,7 +263,7 @@ ForwardPhase SimpleAttentionKVCacheObj::DetermineForwardPhase(
 
 void SimpleAttentionKVCacheObj::BeginForward(const IntTuple& seq_ids,
                                              const IntTuple& append_lengths,
-                                             const Optional<IntTuple>& opt_token_tree_parent_ptr) {
+                                             const ffi::Optional<IntTuple>& opt_token_tree_parent_ptr) {
   CHECK_EQ(seq_ids.size(), append_lengths.size())
       << "seq_ids and append_lengths must have the same size.";
   CHECK_EQ(seq_ids.size(), cur_batch_size_)
@@ -300,17 +300,60 @@ void SimpleAttentionKVCacheObj::BeginForward(const IntTuple& seq_ids,
     // Update sequence length
     cur_seq_lens_host_[seq_idx] += append_len;
   }
-  batch_seq_ind_device_ = NDArray::Empty({cur_batch_size_ + 1}, dtype_aux_int64_, device_);
-  batch_seq_ind_device_.CopyFromBytes(batch_seq_ind_host_.data(),
-                                      (cur_batch_size_ + 1) * sizeof(int64_t));
-  cur_seq_idx_device_ = NDArray::Empty({cur_batch_size_}, dtype_aux_int64_, device_);
-  cur_seq_lens_device_ = NDArray::Empty({cur_batch_size_}, dtype_aux_int64_, device_);
-  cur_seq_idx_device_.CopyFromBytes(cur_seq_idx_host_.data(), cur_batch_size_ * sizeof(int64_t));
-  cur_seq_lens_device_.CopyFromBytes(cur_seq_lens_host_.data(), cur_batch_size_ * sizeof(int64_t));
-  // Copy query positions to device
-  cur_query_positions_ =
-      NDArray::Empty({static_cast<int32_t>(q_positions.size())}, dtype_aux_int32_, device_);
-  cur_query_positions_.CopyFromBytes(q_positions.data(), q_positions.size() * sizeof(int32_t));
+  batch_seq_ind_device_ = Tensor::Empty({cur_batch_size_ + 1}, dtype_aux_int64_, device_);
+  {
+    DLTensor dst = *batch_seq_ind_device_.operator->();
+    DLTensor src;
+    src.data = batch_seq_ind_host_.data();
+    src.device = Device{kDLCPU, 0};
+    src.ndim = 1;
+    src.dtype = batch_seq_ind_device_->dtype;
+    src.shape = batch_seq_ind_device_->shape;
+    src.strides = batch_seq_ind_device_->strides;
+    src.byte_offset = 0;
+    Tensor::CopyFromTo(&src, &dst);
+  }
+  cur_seq_idx_device_ = Tensor::Empty({cur_batch_size_}, dtype_aux_int64_, device_);
+  cur_seq_lens_device_ = Tensor::Empty({cur_batch_size_}, dtype_aux_int64_, device_);
+  {
+    DLTensor dst = *cur_seq_idx_device_.operator->();
+    DLTensor src;
+    src.data = cur_seq_idx_host_.data();
+    src.device = Device{kDLCPU, 0};
+    src.ndim = 1;
+    src.dtype = cur_seq_idx_device_->dtype;
+    src.shape = cur_seq_idx_device_->shape;
+    src.strides = cur_seq_idx_device_->strides;
+    src.byte_offset = 0;
+    Tensor::CopyFromTo(&src, &dst);
+  }
+  {
+    DLTensor dst = *cur_seq_lens_device_.operator->();
+    DLTensor src;
+    src.data = cur_seq_lens_host_.data();
+    src.device = Device{kDLCPU, 0};
+    src.ndim = 1;
+    src.dtype = cur_seq_lens_device_->dtype;
+    src.shape = cur_seq_lens_device_->shape;
+    src.strides = cur_seq_lens_device_->strides;
+    src.byte_offset = 0;
+    Tensor::CopyFromTo(&src, &dst);
+  }
+  // Copy query positions to host Tensor (CPU)
+  cur_query_positions_ = Tensor::Empty({static_cast<int32_t>(q_positions.size())},
+                                       dtype_aux_int32_, device_);
+  {
+    DLTensor dst = *cur_query_positions_.operator->();
+    DLTensor src;
+    src.data = q_positions.data();
+    src.device = Device{kDLCPU, 0};  // q_positions is host memory, must use CPU device
+    src.ndim = 1;
+    src.dtype = cur_query_positions_->dtype;
+    src.shape = cur_query_positions_->shape;
+    src.strides = cur_query_positions_->strides;
+    src.byte_offset = 0;
+    Tensor::CopyFromTo(&src, &dst);
+  }
 }
 
 void SimpleAttentionKVCacheObj::EndForward() {
@@ -328,8 +371,8 @@ void SimpleAttentionKVCacheObj::DisaggMarkSend(int64_t seq_id, int64_t begin,
   LOG(FATAL) << "Disaggregation is not supported in SimpleKVCache.";
 }
 
-void SimpleAttentionKVCacheObj::AttentionWithFusedQKV(int64_t layer_id, NDArray qkv_data,
-                                                      Optional<NDArray> mask, NDArray o_data,
+void SimpleAttentionKVCacheObj::AttentionWithFusedQKV(int64_t layer_id, Tensor qkv_data,
+                                                      ffi::Optional<Tensor> mask, Tensor o_data,
                                                       double sm_scale) {
   CHECK_GE(layer_id, 0) << "Layer ID must be non-negative.";
   CHECK_LT(layer_id, num_layers_) << "Layer ID " << layer_id << " exceeds number of layers "
@@ -340,9 +383,9 @@ void SimpleAttentionKVCacheObj::AttentionWithFusedQKV(int64_t layer_id, NDArray 
   CHECK_EQ(qkv_data->shape[1], num_qo_heads_ + 2 * num_kv_heads_);
   CHECK_EQ(qkv_data->shape[2], head_dim_);
   // Copy Q, K, V data from fused QKV tensor
-  NDArray q_view = q_data_tmp_.CreateView({total_len, num_qo_heads_, head_dim_}, qkv_data->dtype);
-  NDArray k_view = k_data_tmp_.CreateView({total_len, num_kv_heads_, head_dim_}, qkv_data->dtype);
-  NDArray v_view = v_data_tmp_.CreateView({total_len, num_kv_heads_, head_dim_}, qkv_data->dtype);
+  Tensor q_view = q_data_tmp_.CreateView({total_len, num_qo_heads_, head_dim_}, qkv_data->dtype);
+  Tensor k_view = k_data_tmp_.CreateView({total_len, num_kv_heads_, head_dim_}, qkv_data->dtype);
+  Tensor v_view = v_data_tmp_.CreateView({total_len, num_kv_heads_, head_dim_}, qkv_data->dtype);
 
   f_split_rotary_(qkv_data, cur_query_positions_, q_view, k_view, v_view, rope_mode_);
   // Append KV to cache with correct TIR interface
@@ -369,27 +412,27 @@ void SimpleAttentionKVCacheObj::AttentionWithFusedQKV(int64_t layer_id, NDArray 
                  cur_seq_lens_device_, o_data, sm_scale, max_query_len, causal);
 }
 
-void SimpleAttentionKVCacheObj::SelfAttention(int64_t layer_id, NDArray q_data, NDArray k_data,
-                                              NDArray v_data, NDArray o_data, NDArray lse_data,
+void SimpleAttentionKVCacheObj::SelfAttention(int64_t layer_id, Tensor q_data, Tensor k_data,
+                                              Tensor v_data, Tensor o_data, Tensor lse_data,
                                               double sm_scale) {
   LOG(FATAL) << "SelfAttention is not implemented in SimpleKVCache.";
 }
 
-void SimpleAttentionKVCacheObj::CrossAttention(int64_t layer_id, NDArray q_data, NDArray o_data,
-                                               NDArray lse_data, double sm_scale) {
+void SimpleAttentionKVCacheObj::CrossAttention(int64_t layer_id, Tensor q_data, Tensor o_data,
+                                               Tensor lse_data, double sm_scale) {
   LOG(FATAL) << "Cross attention is not implemented in SimpleKVCache.";
 }
 
-void SimpleAttentionKVCacheObj::AppendMLAKV(int64_t layer_id, NDArray kv_data) {
+void SimpleAttentionKVCacheObj::AppendMLAKV(int64_t layer_id, Tensor kv_data) {
   LOG(FATAL) << "MLA is not supported in SimpleKVCache.";
 }
 
-Array<NDArray> SimpleAttentionKVCacheObj::MergeAttnOutputInplace(NDArray o_self_attn,
-                                                                 NDArray lse_self_attn,
-                                                                 NDArray o_cross_attn,
-                                                                 NDArray lse_cross_attn) {
+ffi::Array<Tensor> SimpleAttentionKVCacheObj::MergeAttnOutputInplace(Tensor o_self_attn,
+                                                                Tensor lse_self_attn,
+                                                                Tensor o_cross_attn,
+                                                                Tensor lse_cross_attn) {
   LOG(FATAL) << "MergeAttnOutputInplace is not implemented in SimpleKVCache.";
-  return Array<NDArray>{};
+  return ffi::Array<Tensor>{};
 }
 
 void SimpleAttentionKVCacheObj::CommitAcceptedTokenTreeNodes(const IntTuple& seq_ids,
@@ -397,12 +440,12 @@ void SimpleAttentionKVCacheObj::CommitAcceptedTokenTreeNodes(const IntTuple& seq
   LOG(WARNING) << "Tree attention is not supported in SimpleKVCache. Ignoring commit operation.";
 }
 
-NDArray SimpleAttentionKVCacheObj::GetQueryPositions() { return cur_query_positions_; }
+Tensor SimpleAttentionKVCacheObj::GetQueryPositions() { return cur_query_positions_; }
 
 ForwardPhase SimpleAttentionKVCacheObj::GetCurrentPhase() const { return current_phase_; }
 
 void SimpleAttentionKVCacheObj::DebugGetKV(int64_t seq_id, int64_t start_pos, int64_t end_pos,
-                                           NDArray k_data, NDArray v_data) {
+                                           Tensor k_data, Tensor v_data) {
   auto it = seq_id_to_idx_.find(seq_id);
   CHECK(it != seq_id_to_idx_.end()) << "Sequence " << seq_id << " not found.";
 
@@ -415,40 +458,40 @@ void SimpleAttentionKVCacheObj::DebugGetKV(int64_t seq_id, int64_t start_pos, in
   for (int layer = 0; layer < num_layers_; ++layer) {
     for (int64_t pos = start_pos; pos < end_pos; ++pos) {
       // Copy K data
-      NDArray k_src =
+      Tensor k_src =
           cache_[layer].CreateView({1, num_kv_heads_, head_dim_}, cache_[layer]->dtype,
                                    ((seq_idx * max_seq_len_ + pos) * 2) * num_kv_heads_ *
                                        head_dim_ * cache_[layer].DataType().bytes());
-      NDArray k_dst = k_data.CreateView({1, num_kv_heads_, head_dim_}, k_data->dtype,
-                                        (layer * (end_pos - start_pos) + (pos - start_pos)) *
-                                            num_kv_heads_ * head_dim_ * k_data.DataType().bytes());
+      Tensor k_dst = k_data.CreateView({1, num_kv_heads_, head_dim_}, k_data->dtype,
+                                       (layer * (end_pos - start_pos) + (pos - start_pos)) *
+                                           num_kv_heads_ * head_dim_ * k_data.DataType().bytes());
       k_dst.CopyFrom(k_src);
 
       // Copy V data
-      NDArray v_src =
+      Tensor v_src =
           cache_[layer].CreateView({1, num_kv_heads_, head_dim_}, cache_[layer]->dtype,
                                    ((seq_idx * max_seq_len_ + pos) * 2 + 1) * num_kv_heads_ *
                                        head_dim_ * cache_[layer].DataType().bytes());
-      NDArray v_dst = v_data.CreateView({1, num_kv_heads_, head_dim_}, v_data->dtype,
-                                        (layer * (end_pos - start_pos) + (pos - start_pos)) *
-                                            num_kv_heads_ * head_dim_ * v_data.DataType().bytes());
+      Tensor v_dst = v_data.CreateView({1, num_kv_heads_, head_dim_}, v_data->dtype,
+                                       (layer * (end_pos - start_pos) + (pos - start_pos)) *
+                                           num_kv_heads_ * head_dim_ * v_data.DataType().bytes());
       v_dst.CopyFrom(v_src);
     }
   }
 }
 
 void SimpleAttentionKVCacheObj::DebugGetKVMLA(int64_t seq_id, int64_t start_pos, int64_t end_pos,
-                                              NDArray kv_data) {
+                                              Tensor kv_data) {
   LOG(FATAL) << "MLA debug is not supported in SimpleKVCache.";
 }
 
-void SimpleAttentionKVCacheObj::DebugSetKV(int64_t seq_id, int64_t start_pos, NDArray k_data,
-                                           NDArray v_data) {
+void SimpleAttentionKVCacheObj::DebugSetKV(int64_t seq_id, int64_t start_pos, Tensor k_data,
+                                           Tensor v_data) {
   LOG(FATAL) << "DebugSetKV is not implemented in SimpleKVCache.";
 }
 
-void SimpleAttentionKVCacheObj::LinearAttention(int64_t layer_id, NDArray q_data, NDArray k_data,
-                                                NDArray v_data, double sm_scale) {
+void SimpleAttentionKVCacheObj::LinearAttention(int64_t layer_id, Tensor q_data, Tensor k_data,
+                                                Tensor v_data, double sm_scale) {
   LOG(FATAL) << "Linear attention is not supported in SimpleKVCache.";
 }
 
@@ -461,13 +504,13 @@ void SimpleAttentionKVCacheObj::UpdateSequenceLength(int64_t seq_idx, int64_t ne
   cur_seq_lens_host_[seq_idx] = new_length;
 }
 
-TVM_REGISTER_OBJECT_TYPE(SimpleAttentionKVCacheObj);
+// TVM_FFI_REGISTER_OBJECT_TYPE(SimpleAttentionKVCacheObj);
 
 //-------------------------------------------------
 //  Register runtime functions
 //-------------------------------------------------
 
-TVM_FFI_STATIC_INIT_BLOCK({
+TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def_packed(
       "vm.builtin.simple_attention_kv_cache_create", [](ffi::PackedArgs args, ffi::Any* rv) {
@@ -486,18 +529,18 @@ TVM_FFI_STATIC_INIT_BLOCK({
         int rope_mode = args[5].cast<int>();
         double rotary_scale = args[6].cast<double>();
         double rotary_theta = args[7].cast<double>();
-        Optional<NDArray> rope_ext_factors = std::nullopt;  // args[8]
-        NDArray init = args[9].cast<NDArray>();
+        ffi::Optional<Tensor> rope_ext_factors = std::nullopt;  // args[8]
+        Tensor init = args[9].cast<Tensor>();
         ffi::Function f_append_kv = args[10].cast<ffi::Function>();
         ffi::Function f_attention_prefill = args[11].cast<ffi::Function>();
         ffi::Function f_attention_decode = args[12].cast<ffi::Function>();
         ffi::Function f_split_rotary = args[13].cast<ffi::Function>();
 
-        if (auto opt_nd = args[8].as<NDArray>()) {
+        if (auto opt_nd = args[8].as<Tensor>()) {
           rope_ext_factors = opt_nd.value();
         }
 
-        ObjectPtr<SimpleAttentionKVCacheObj> n = make_object<SimpleAttentionKVCacheObj>(
+        ObjectPtr<SimpleAttentionKVCacheObj> n = ffi::make_object<SimpleAttentionKVCacheObj>(
             max_batch_size, max_seq_len, num_layers, num_qo_heads, num_kv_heads, head_dim,
             RoPEMode(rope_mode), rotary_scale, rotary_theta, std::move(rope_ext_factors),
             init->dtype, init->device, std::move(f_append_kv), std::move(f_attention_prefill),
@@ -517,18 +560,18 @@ TVM_FFI_STATIC_INIT_BLOCK({
       "vm.builtin.attention_kv_cache_attention_with_fused_qkv_simple",
       [](ffi::PackedArgs args, ffi::Any* rv) {
         CHECK_EQ(args.size(), 5) << "Invalid number of arguments.";
-        // NDArray output = args[0].cast<NDArray>();  // DPS output tensor (first argument)
+        // Tensor output = args[0].cast<Tensor>();  // DPS output tensor (first argument)
         AttentionKVCache cache = args[0].cast<AttentionKVCache>();
         int64_t layer_id = args[1].cast<int64_t>();
         double sm_scale = args[2].cast<double>();
-        NDArray qkv_data = args[3].cast<NDArray>();
-        NDArray output = args[4].cast<NDArray>();  // DPS output tensor (first argument)
+        Tensor qkv_data = args[3].cast<Tensor>();
+        Tensor output = args[4].cast<Tensor>();  // DPS output tensor (first argument)
 
         // Use the provided output tensor instead of creating a new one
         cache->AttentionWithFusedQKV(layer_id, qkv_data, std::nullopt, output, sm_scale);
         // No need to set *rv since we're using DPS (destination passing style)
       });
-});
+}
 
 }  // namespace vm
 }  // namespace runtime
