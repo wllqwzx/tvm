@@ -23,7 +23,7 @@
 #ifndef TVM_RUNTIME_VM_SIMPLE_KV_CACHE_H_
 #define TVM_RUNTIME_VM_SIMPLE_KV_CACHE_H_
 
-#include <tvm/runtime/ndarray.h>
+// #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/object.h>
 
 #include <vector>

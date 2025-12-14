@@ -26,7 +26,6 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/logging.h>
-#include <tvm/runtime/ndarray.h>
 
 #include <algorithm>
 #include <numeric>
