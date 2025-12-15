@@ -789,6 +789,74 @@ def test_transpose():
     verify_unary("Transpose", [32, 32, 32], attrs={"perm": [1, 2, 0]})
 
 
+def test_transpose_scalar():
+    """Test Transpose with scalar inputs - should return scalar unchanged."""
+    # Test scalar with no perm attribute (default behavior)
+    scalar_node = helper.make_node("Transpose", ["x"], ["y"])
+    graph = helper.make_graph(
+        [scalar_node],
+        "transpose_scalar_test",
+        inputs=[helper.make_tensor_value_info("x", TensorProto.FLOAT, [])],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [])],
+    )
+    model = helper.make_model(graph, producer_name="transpose_scalar_test")
+    check_correctness(model)
+
+    # Test with scalar constant and transpose without perm
+    scalar_constant = helper.make_node(
+        "Constant",
+        [],
+        ["scalar"],
+        value=helper.make_tensor("value", TensorProto.FLOAT, [], [5.0]),
+    )
+
+    transpose_node = helper.make_node("Transpose", ["scalar"], ["y"])
+    graph = helper.make_graph(
+        [scalar_constant, transpose_node],
+        "transpose_scalar_constant_test",
+        inputs=[],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [])],
+    )
+    model = helper.make_model(graph, producer_name="transpose_scalar_constant_test")
+    check_correctness(model)
+
+
+def test_transpose_axes_validation():
+    """Test Transpose validation - perm axes count must match tensor dimensions"""
+    # Test 1D tensor with correct perm
+    transpose_1d_valid = helper.make_node("Transpose", ["x"], ["y"], perm=[0])
+    graph_1d_valid = helper.make_graph(
+        [transpose_1d_valid],
+        "transpose_1d_valid_test",
+        inputs=[helper.make_tensor_value_info("x", TensorProto.FLOAT, [10])],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [10])],
+    )
+    model_1d_valid = helper.make_model(graph_1d_valid, producer_name="transpose_1d_valid_test")
+    check_correctness(model_1d_valid)
+
+    # Test 2D tensor with correct perm
+    transpose_2d_valid = helper.make_node("Transpose", ["x"], ["y"], perm=[1, 0])
+    graph_2d_valid = helper.make_graph(
+        [transpose_2d_valid],
+        "transpose_2d_valid_test",
+        inputs=[helper.make_tensor_value_info("x", TensorProto.FLOAT, [3, 4])],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [4, 3])],
+    )
+    model_2d_valid = helper.make_model(graph_2d_valid, producer_name="transpose_2d_valid_test")
+    check_correctness(model_2d_valid)
+
+    # Test 3D tensor with correct perm
+    transpose_3d_valid = helper.make_node("Transpose", ["x"], ["y"], perm=[2, 0, 1])
+    graph_3d_valid = helper.make_graph(
+        [transpose_3d_valid],
+        "transpose_3d_valid_test",
+        inputs=[helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3, 4])],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [4, 2, 3])],
+    )
+    model_3d_valid = helper.make_model(graph_3d_valid, producer_name="transpose_3d_valid_test")
+    check_correctness(model_3d_valid)
+
+
 def test_unsqueeze():
     unsqueeze_node = helper.make_node("Unsqueeze", ["a", "axes"], ["b"])
 
@@ -826,6 +894,36 @@ def test_gelu():
 
 def test_bias_gelu():
     verify_binary("BiasGelu", [32, 32], [32], [32, 32], domain="com.microsoft")
+
+
+def test_fast_gelu():
+    """Test FastGelu with and without bias"""
+    # Test FastGelu without bias
+    fast_gelu_node = helper.make_node("FastGelu", ["x"], ["y"], domain="com.microsoft")
+    graph = helper.make_graph(
+        [fast_gelu_node],
+        "fast_gelu_test",
+        inputs=[helper.make_tensor_value_info("x", TensorProto.FLOAT, [32, 32])],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [32, 32])],
+    )
+    model = helper.make_model(graph, producer_name="fast_gelu_test")
+    check_correctness(model)
+
+    # Test FastGelu with bias
+    fast_gelu_with_bias_node = helper.make_node(
+        "FastGelu", ["x", "bias"], ["y"], domain="com.microsoft"
+    )
+    graph_with_bias = helper.make_graph(
+        [fast_gelu_with_bias_node],
+        "fast_gelu_with_bias_test",
+        inputs=[
+            helper.make_tensor_value_info("x", TensorProto.FLOAT, [32, 32]),
+            helper.make_tensor_value_info("bias", TensorProto.FLOAT, [32]),
+        ],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [32, 32])],
+    )
+    model_with_bias = helper.make_model(graph_with_bias, producer_name="fast_gelu_with_bias_test")
+    check_correctness(model_with_bias)
 
 
 def test_where():

@@ -23,8 +23,8 @@
 #ifndef TVM_RUNTIME_VM_SIMPLE_KV_CACHE_H_
 #define TVM_RUNTIME_VM_SIMPLE_KV_CACHE_H_
 
-#include <tvm/runtime/tensor.h>
 #include <tvm/runtime/object.h>
+#include <tvm/runtime/tensor.h>
 
 #include <vector>
 
@@ -166,8 +166,8 @@ class SimpleAttentionKVCacheObj : public AttentionKVCacheObj {
 
   void AttentionWithFusedQKV(int64_t layer_id, Tensor qkv_data, ffi::Optional<Tensor> mask,
                              Tensor o_data, double sm_scale) final;
-  void SelfAttention(int64_t layer_id, Tensor q_data, Tensor k_data, Tensor v_data,
-                     Tensor o_data, Tensor lse_data, double sm_scale) final;
+  void SelfAttention(int64_t layer_id, Tensor q_data, Tensor k_data, Tensor v_data, Tensor o_data,
+                     Tensor lse_data, double sm_scale) final;
   void CrossAttention(int64_t layer_id, Tensor q_data, Tensor o_data, Tensor lse_data,
                       double sm_scale) final;
   void AppendMLAKV(int64_t layer_id, Tensor kv_data) final;
@@ -189,7 +189,8 @@ class SimpleAttentionKVCacheObj : public AttentionKVCacheObj {
                        double sm_scale) final;
 
   // static constexpr const char* _type_key = "relax.vm.SimpleAttentionKVCache";
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("relax.vm.SimpleAttentionKVCache", SimpleAttentionKVCacheObj, AttentionKVCacheObj);
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("relax.vm.SimpleAttentionKVCache", SimpleAttentionKVCacheObj,
+                                    AttentionKVCacheObj);
 
   /*! \brief Internal method to update sequence lengths. */
   void UpdateSequenceLength(int64_t seq_idx, int64_t new_length);

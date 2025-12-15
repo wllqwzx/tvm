@@ -55,18 +55,18 @@ SimpleAttentionKVCacheObj::SimpleAttentionKVCacheObj(
       rotary_theta_(rotary_theta),
       rope_ext_factors_(std::move(rope_ext_factors)),
       kv_dtype_(DataType(dtype)),
+      cur_batch_size_(0),
+      current_phase_(ForwardPhase::kPrefill),
       f_append_kv_(std::move(f_append_kv)),
       f_attention_prefill_(std::move(f_attention_prefill)),
       f_attention_decode_(std::move(f_attention_decode)),
       f_split_rotary_(std::move(f_split_rotary)),
-      device_(device),
-      cur_batch_size_(0),
-      current_phase_(ForwardPhase::kPrefill) {
+      device_(device) {
   // Initialize cache storage
   cache_.reserve(num_layers);
   for (int i = 0; i < num_layers; ++i) {
-    cache_.push_back(Tensor::Empty({max_batch_size_, max_seq_len_, 2, num_kv_heads_, head_dim_},
-                                   dtype, device));
+    cache_.push_back(
+        Tensor::Empty({max_batch_size_, max_seq_len_, 2, num_kv_heads_, head_dim_}, dtype, device));
   }
 
   // Initialize sequence management
@@ -261,9 +261,9 @@ ForwardPhase SimpleAttentionKVCacheObj::DetermineForwardPhase(
   return all_single_token ? ForwardPhase::kDecode : ForwardPhase::kPrefill;
 }
 
-void SimpleAttentionKVCacheObj::BeginForward(const IntTuple& seq_ids,
-                                             const IntTuple& append_lengths,
-                                             const ffi::Optional<IntTuple>& opt_token_tree_parent_ptr) {
+void SimpleAttentionKVCacheObj::BeginForward(
+    const IntTuple& seq_ids, const IntTuple& append_lengths,
+    const ffi::Optional<IntTuple>& opt_token_tree_parent_ptr) {
   CHECK_EQ(seq_ids.size(), append_lengths.size())
       << "seq_ids and append_lengths must have the same size.";
   CHECK_EQ(seq_ids.size(), cur_batch_size_)
@@ -340,8 +340,8 @@ void SimpleAttentionKVCacheObj::BeginForward(const IntTuple& seq_ids,
     Tensor::CopyFromTo(&src, &dst);
   }
   // Copy query positions to host Tensor (CPU)
-  cur_query_positions_ = Tensor::Empty({static_cast<int32_t>(q_positions.size())},
-                                       dtype_aux_int32_, device_);
+  cur_query_positions_ =
+      Tensor::Empty({static_cast<int32_t>(q_positions.size())}, dtype_aux_int32_, device_);
   {
     DLTensor dst = *cur_query_positions_.operator->();
     DLTensor src;
@@ -428,9 +428,9 @@ void SimpleAttentionKVCacheObj::AppendMLAKV(int64_t layer_id, Tensor kv_data) {
 }
 
 ffi::Array<Tensor> SimpleAttentionKVCacheObj::MergeAttnOutputInplace(Tensor o_self_attn,
-                                                                Tensor lse_self_attn,
-                                                                Tensor o_cross_attn,
-                                                                Tensor lse_cross_attn) {
+                                                                     Tensor lse_self_attn,
+                                                                     Tensor o_cross_attn,
+                                                                     Tensor lse_cross_attn) {
   LOG(FATAL) << "MergeAttnOutputInplace is not implemented in SimpleKVCache.";
   return ffi::Array<Tensor>{};
 }
@@ -458,10 +458,9 @@ void SimpleAttentionKVCacheObj::DebugGetKV(int64_t seq_id, int64_t start_pos, in
   for (int layer = 0; layer < num_layers_; ++layer) {
     for (int64_t pos = start_pos; pos < end_pos; ++pos) {
       // Copy K data
-      Tensor k_src =
-          cache_[layer].CreateView({1, num_kv_heads_, head_dim_}, cache_[layer]->dtype,
-                                   ((seq_idx * max_seq_len_ + pos) * 2) * num_kv_heads_ *
-                                       head_dim_ * cache_[layer].DataType().bytes());
+      Tensor k_src = cache_[layer].CreateView({1, num_kv_heads_, head_dim_}, cache_[layer]->dtype,
+                                              ((seq_idx * max_seq_len_ + pos) * 2) * num_kv_heads_ *
+                                                  head_dim_ * cache_[layer].DataType().bytes());
       Tensor k_dst = k_data.CreateView({1, num_kv_heads_, head_dim_}, k_data->dtype,
                                        (layer * (end_pos - start_pos) + (pos - start_pos)) *
                                            num_kv_heads_ * head_dim_ * k_data.DataType().bytes());

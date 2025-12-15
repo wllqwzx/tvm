@@ -340,6 +340,8 @@ class BinaryBase(OnnxOpConverter):
             x = _to_numpy(inputs[0])
             y = _to_numpy(inputs[1])
             output = cls.numpy_op(x, y)  # pylint: disable=not-callable
+            if isinstance(x, relax.PrimValue) and isinstance(y, relax.PrimValue):
+                return relax.PrimValue(output.item())
             if x.dtype == y.dtype:
                 # no numpy precision widening
                 output = output.astype(x.dtype)
@@ -643,11 +645,34 @@ class Transpose(OnnxOpConverter):
 
     @classmethod
     def _impl_v13(cls, bb, inputs, attr, params):
+        data = inputs[0]
         axes = attr.get("perm", None)
-        if isinstance(inputs[0], relax.Constant):
-            output = _np.transpose(inputs[0].data.numpy(), axes)
+
+        if hasattr(data.struct_info, "ndim"):
+            input_ndim = data.struct_info.ndim
+        elif hasattr(data.struct_info, "shape") and data.struct_info.shape:
+            input_ndim = len(data.struct_info.shape)
+        else:
+            if isinstance(data, relax.Constant):
+                input_ndim = data.data.numpy().ndim
+            else:
+                input_ndim = None
+
+        if input_ndim == 0:
+            return data
+
+        if input_ndim is not None and axes is not None:
+            if len(axes) != input_ndim:
+                raise ValueError(
+                    f"Transpose: number of axes in perm attribute ({len(axes)}) "
+                    f"must equal the number of input tensor dimensions ({input_ndim})"
+                )
+
+        if isinstance(data, relax.Constant):
+            output = _np.transpose(data.data.numpy(), axes)
             return relax.const(output, output.dtype)
-        return relax.op.permute_dims(inputs[0], axes)
+
+        return relax.op.permute_dims(data, axes)
 
 
 class Unsqueeze(OnnxOpConverter):
@@ -1155,11 +1180,12 @@ class FastGelu(OnnxOpConverter):
 
     @classmethod
     def _impl_v1(cls, bb, inputs, attr, params):
-        if inputs[1]:
+        x = inputs[0]
+        if len(inputs) > 1 and inputs[1] is not None:
             bias = inputs[1]
             bias_shape = bias.struct_info.shape
             assert len(bias_shape) == 1, "bias term must be a 1D tensor"
-            x += bias
+            x = bb.emit(relax.op.add(x, bias))
 
         # Declare consts
         const_dtype = x.struct_info.dtype
@@ -1169,11 +1195,13 @@ class FastGelu(OnnxOpConverter):
         const2 = relax.const(0.044715 * math.sqrt(2 / math.pi), dtype=const_dtype)
 
         # Compute FastGelu
-        term1 = relax.op.multiply(half, x)
-        term2 = relax.op.multiply(const1, x)
-        term3 = relax.op.multiply(const2, relax.op.power(x, relax.const(3, const_dtype)))
-        tanh = relax.op.tanh(relax.op.add(term2, term3))
-        return relax.op.multiply(term1, relax.op.add(one, tanh))
+        term1 = bb.emit(relax.op.multiply(half, x))
+        term2 = bb.emit(relax.op.multiply(const1, x))
+        # use x^3 = x * x * x instead of pow(x, 3) for better performance
+        x_cubed = bb.emit(relax.op.multiply(relax.op.multiply(x, x), x))
+        term3 = bb.emit(relax.op.multiply(const2, x_cubed))
+        tanh = bb.emit(relax.op.tanh(relax.op.add(term2, term3)))
+        return bb.emit(relax.op.multiply(term1, relax.op.add(one, tanh)))
 
 
 class BiasGelu(OnnxOpConverter):

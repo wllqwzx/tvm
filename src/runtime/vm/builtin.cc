@@ -535,7 +535,7 @@ bool ReadIfCond(ffi::AnyView cond) {
   if (arr->device.device_type != kDLCPU) {
     arr = arr.CopyTo(DLDevice{kDLCPU, 0});
   }
-  ICHECK(arr->dtype.code == kDLInt || arr->dtype.code == kDLUInt);
+  ICHECK(arr->dtype.code == kDLInt || arr->dtype.code == kDLUInt || arr->dtype.code == kDLBool);
   int64_t result;
   switch (arr->dtype.bits) {
     case 1: {
@@ -735,7 +735,7 @@ int TVMBackendAnyListMoveFromPackedReturn(void* anylist, int index, TVMFFIAny* a
   using namespace tvm::runtime;
   TVM_FFI_SAFE_CALL_BEGIN();
   auto* list = static_cast<tvm::ffi::Any*>(anylist);
-  list[index] = tvm::ffi::details::AnyUnsafe::MoveTVMFFIAnyToAny(std::move(args[ret_offset]));
+  list[index] = tvm::ffi::details::AnyUnsafe::MoveTVMFFIAnyToAny(&args[ret_offset]);
   TVM_FFI_SAFE_CALL_END();
 }
 }  // extern "C"
