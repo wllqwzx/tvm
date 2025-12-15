@@ -40,9 +40,9 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         self.env: Dict[fx.Node, relax.Expr] = {}
         self.params: Dict[torch.Tensor, relax.Expr] = {}
         self.block_builder: relax.BlockBuilder = None
-        self.convert_map: Dict[
-            Union[torch.nn.Module, str], Callable[[fx.Node], relax.Var]
-        ] = self.create_convert_map()
+        self.convert_map: Dict[Union[torch.nn.Module, str], Callable[[fx.Node], relax.Var]] = (
+            self.create_convert_map()
+        )
 
     ########## Utilities ##########
 
@@ -104,6 +104,22 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         tensor = tensor.detach().cpu()
         dtype = BaseFXGraphImporter._convert_data_type(str(tensor.data.dtype))
         return relax.const(tensor.data.numpy(), dtype)
+
+    @staticmethod
+    def _convert_to_expr_list(values):
+        """Convert a list of values to a list of expressions, handling PrimValue conversion."""
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+
+        result = []
+        for value in values:
+            if isinstance(value, relax.expr.PrimValue):
+                result.append(value.value)
+            elif isinstance(value, (relax.Var, relax.Expr)):
+                result.append(value)
+            else:
+                result.append(value)
+        return result
 
     @staticmethod
     def shape_of(tensor):
@@ -490,20 +506,61 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                                 rhs = self.block_builder.emit(relax.op.astype(rhs, target_dtype))
                     return lhs, rhs
                 elif isinstance(lhs, relax.Expr):
-                    assert isinstance(lhs.struct_info, relax.TensorStructInfo)
-                    return lhs, relax.const(rhs, lhs.struct_info.dtype)
+                    # Handle TensorStructInfo for regular tensors
+                    if isinstance(lhs.struct_info, relax.TensorStructInfo):
+                        return lhs, relax.const(rhs, lhs.struct_info.dtype)
+                    # For PrimValue, we need to determine the appropriate dtype
+                    elif isinstance(lhs, relax.PrimValue):
+                        # PrimValue operations should work with PrimValue
+                        return lhs, relax.PrimValue(rhs)
+                    else:
+                        # Fallback for other relax.Expr types
+                        return lhs, relax.const(rhs, "int64")  # Default dtype
                 elif isinstance(rhs, relax.Expr):
-                    assert isinstance(rhs.struct_info, relax.TensorStructInfo)
-                    return relax.const(lhs, rhs.struct_info.dtype), rhs
+                    # Handle TensorStructInfo for regular tensors
+                    if isinstance(rhs.struct_info, relax.TensorStructInfo):
+                        return relax.const(lhs, rhs.struct_info.dtype), rhs
+                    # For PrimValue, we need to determine the appropriate dtype
+                    elif isinstance(rhs, relax.PrimValue):
+                        # PrimValue operations should work with PrimValue
+                        return relax.PrimValue(lhs), rhs
+                    else:
+                        # Fallback for other relax.Expr types
+                        return relax.const(lhs, "int64"), rhs  # Default dtype
                 else:
                     assert False
 
             def call_binary_op(op, lhs, rhs):
                 lhs, rhs = promote_binary_op_args(lhs, rhs)
-                return self.block_builder.emit(op(lhs, rhs))
+                # Special handling for PrimValue operations - do compile-time calculation on their values
+                if isinstance(lhs, relax.PrimValue) and isinstance(rhs, relax.PrimValue):
+                    # PrimValue operations: directly compute on the underlying TIR expressions
+                    if op == relax.op.add:
+                        result_expr = lhs.value + rhs.value
+                    elif op == relax.op.subtract:
+                        result_expr = lhs.value - rhs.value
+                    elif op == relax.op.multiply:
+                        result_expr = lhs.value * rhs.value
+                    elif op == relax.op.divide or op == relax.op.floor_divide:
+                        result_expr = (
+                            lhs.value // rhs.value
+                        )  # Use floor division for integer expressions
+                    else:
+                        # For other operations, fall back to runtime calculation
+                        return self.block_builder.normalize(op(lhs, rhs))
+
+                    # Return PrimValue with the computed expression
+                    return self.block_builder.normalize(relax.PrimValue(result_expr))
+                else:
+                    # Regular runtime calculation
+                    return self.block_builder.emit(op(lhs, rhs))
 
             lhs, rhs = self.retrieve_args(node)
             if isinstance(lhs, relax.Var) or isinstance(rhs, relax.Var):
+                return call_binary_op(relax_op, lhs, rhs)
+
+            elif isinstance(lhs, relax.PrimValue) or isinstance(rhs, relax.PrimValue):
+                # Handle PrimValue cases (from _sym_size_int)
                 return call_binary_op(relax_op, lhs, rhs)
             elif isinstance(lhs, relax.expr.Constant):
                 return call_binary_op(relax_op, lhs, relax.const(rhs, dtype=lhs.struct_info.dtype))
@@ -1489,49 +1546,10 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         return self.block_builder.emit(relax.op.nn.pixel_shuffle(data, upscale_factor))
 
     def _scaled_dot_product_attention(self, node: fx.Node) -> relax.Var:
-        query_tensor = self.env[node.args[0]]
-        key_tensor = self.env[node.args[1]]
-        value_tensor = self.env[node.args[2]]
-
-        # Check the dimensionality of the input tensors
-        query_ndim = len(query_tensor.struct_info.shape)
-
-        # TVM's nn.attention requires 4D inputs in format (batch, num_heads, seq_len, head_dim)
-        # For 2D inputs (seq_len, head_dim), we need to reshape to 4D first
-        if query_ndim == 2:
-            # 2D input: (seq_len, head_dim) -> expand to (1, 1, seq_len, head_dim)
-            # Add batch dimension at axis 0
-            query_3d = self.block_builder.emit(relax.op.expand_dims(query_tensor, axis=0))
-            key_3d = self.block_builder.emit(relax.op.expand_dims(key_tensor, axis=0))
-            value_3d = self.block_builder.emit(relax.op.expand_dims(value_tensor, axis=0))
-            # Add num_heads dimension at axis 1
-            query = self.block_builder.emit(relax.op.expand_dims(query_3d, axis=1))
-            key = self.block_builder.emit(relax.op.expand_dims(key_3d, axis=1))
-            value = self.block_builder.emit(relax.op.expand_dims(value_3d, axis=1))
-
-            # No permutation needed for 2D inputs after expanding to 4D
-            # After attention, squeeze back to 2D: (1, 1, seq_len, head_dim) -> (seq_len, head_dim)
-            def transpose_and_reshape_back(tensor):
-                # Squeeze batch and num_heads dimensions
-                return self.block_builder.emit(relax.op.squeeze(tensor, axis=[0, 1]))
-
-        elif query_ndim == 4:
-            # 4D input: (batch, seq_len, num_heads, head_dim)
-            # -> (batch, num_heads, seq_len, head_dim)
-            transpose_S_H = lambda tensor: relax.op.permute_dims(tensor, [0, 2, 1, 3])
-            query = self.block_builder.emit(transpose_S_H(query_tensor))
-            key = self.block_builder.emit(transpose_S_H(key_tensor))
-            value = self.block_builder.emit(transpose_S_H(value_tensor))
-
-            # For 4D, transpose back after attention
-            def transpose_and_reshape_back(tensor):
-                return self.block_builder.emit(transpose_S_H(tensor))
-
-        else:
-            raise ValueError(
-                f"scaled_dot_product_attention expects 2D or 4D inputs, but got {query_ndim}D input"
-            )
-
+        transpose_S_H = lambda tensor: relax.op.permute_dims(tensor, [0, 2, 1, 3])
+        query = transpose_S_H(self.env[node.args[0]])
+        key = transpose_S_H(self.env[node.args[1]])
+        value = transpose_S_H(self.env[node.args[2]])
         attn_mask = node.args[3] if len(node.args) > 3 else node.kwargs.get("attn_mask", None)
         dropout_p = node.args[4] if len(node.args) > 4 else node.kwargs.get("dropout_p", 0.0)
         assert dropout_p == 0.0, "Dropout is not supported"
@@ -1543,11 +1561,11 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             msg = "Only a float mask is supported for the attn_mask input."
             assert "float" in attn_mask.struct_info.dtype, msg
 
-        attention_output = self.block_builder.emit(
-            relax.op.nn.attention(query, key, value, bias=attn_mask, causal_mask=causal_mask)
+        return self.block_builder.emit(
+            transpose_S_H(
+                relax.op.nn.attention(query, key, value, bias=attn_mask, causal_mask=causal_mask)
+            )
         )
-
-        return transpose_and_reshape_back(attention_output)
 
     def _unbind(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
@@ -1743,14 +1761,24 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         return self.block_builder.emit(relax.op.cumsum(x, dim, dtype))
 
     def _expand(self, node: fx.Node) -> relax.Var:
+        from tvm.relax.expr import PrimValue
+
         args = self.retrieve_args(node)
         sizes = args[1:] if len(args) > 2 else args[1]
         broadcast_shape, in_shape = [], self.shape_of(args[0])
         for idx, i in enumerate(sizes):
             if isinstance(i, int) and i == -1:
                 broadcast_shape.append(in_shape[idx])
-            else:
+            elif isinstance(i, PrimValue):
+                # For PrimValue, extract the PrimExpr value
+                broadcast_shape.append(i.value)
+            elif isinstance(i, relax.Expr):
+                # For relax expressions, pass directly
                 broadcast_shape.append(i)
+            else:
+                # For other types (int, etc.), pass directly
+                broadcast_shape.append(i)
+
         return self.block_builder.emit(relax.op.broadcast_to(args[0], broadcast_shape))
 
     def _expand_as(self, node: fx.Node) -> relax.Var:
@@ -2061,9 +2089,32 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
     def _reshape(self, node: fx.Node) -> relax.Var:
         import torch  # type: ignore
 
+        from tvm.relax.expr import PrimValue
+
         args = self.retrieve_args(node)
         x = args[0]
         dims = args[1] if isinstance(args[1], (torch.Size, tuple, list)) else args[1:]
+
+        # Convert dims to proper format for relax.op.reshape
+        # Handle PrimValue and other types in the shape
+        if isinstance(dims, (list, tuple)):
+            shape_tuple = []
+            for dim in dims:
+                if isinstance(dim, int):
+                    shape_tuple.append(dim)
+                elif isinstance(dim, PrimValue):
+                    # For PrimValue, extract the PrimExpr value
+                    shape_tuple.append(dim.value)
+                elif isinstance(dim, relax.Var):
+                    # For relax.Var, pass directly (relax.op.reshape can handle Expr)
+                    shape_tuple.append(dim)
+                elif isinstance(dim, relax.Expr):
+                    # For other relax expressions, pass directly
+                    shape_tuple.append(dim)
+                else:
+                    # Pass through other types directly (like constants)
+                    shape_tuple.append(dim)
+            dims = tuple(shape_tuple)
 
         # Skip identity reshape
         current_shape = self.shape_of(x)
@@ -2300,16 +2351,31 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _full(self, node: fx.Node) -> relax.Var:
         import torch
+        from tvm.relax.expr import PrimValue
 
         args = self.retrieve_args(node)
-        size = relax.ShapeExpr(args[0] if isinstance(args[0], (list, tuple)) else (args[0],))
+        shape_args = args[0] if isinstance(args[0], (list, tuple)) else (args[0],)
+
+        # Use the helper method to convert shape arguments properly
+        shape_list = self._convert_to_expr_list(shape_args)
+
+        # Convert to ShapeExpr
+        try:
+            shape_expr = relax.ShapeExpr(shape_list)
+        except Exception as e:
+            # If ShapeExpr creation fails, log details and re-raise
+            print(f" Failed to create ShapeExpr from {shape_list}")
+            print(f"   Original args: {shape_args}")
+            print(f"   Types: {[type(x) for x in shape_list]}")
+            raise e
+
         dtype = self._convert_data_type(
             node.kwargs.get("dtype", torch.get_default_dtype()), self.env
         )
         value = args[1] if isinstance(args[1], relax.expr.Constant) else relax.const(args[1], dtype)
         return self.block_builder.emit(
             relax.op.full(
-                size,
+                shape_expr,
                 value,
                 dtype,
             )
@@ -2440,9 +2506,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         size = (
             args[1]
             if isinstance(args[1], (list, tuple))
-            else (args[1],)
-            if len(args[1:]) == 1
-            else args[1:]
+            else (args[1],) if len(args[1:]) == 1 else args[1:]
         )
         size = relax.ShapeExpr(size)
         return self.block_builder.emit(
@@ -2455,9 +2519,22 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _ones(self, node: fx.Node) -> relax.Var:
         import torch
+        from tvm.relax.expr import PrimValue
 
         args = self.retrieve_args(node)
-        size = relax.ShapeExpr(args[0] if isinstance(args[0], (list, tuple)) else (args[0],))
+
+        # Handle size argument with PrimValue conversion
+        size_arg = args[0] if isinstance(args[0], (list, tuple)) else (args[0],)
+        converted_size = []
+        for s in size_arg:
+            if isinstance(s, PrimValue):
+                # For PrimValue, extract the PrimExpr value
+                converted_size.append(s.value)
+            else:
+                # For other types, pass directly
+                converted_size.append(s)
+
+        size = relax.ShapeExpr(converted_size)
         dtype = self._convert_data_type(
             node.kwargs.get("dtype", torch.get_default_dtype()), self.env
         )
@@ -2531,7 +2608,11 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                     i = i + 1
                 elif isinstance(index, slice):
                     stride_begin.append(0 if index.start is None else index.start)
-                    stride_end.append(shape[i] if index.stop is None else index.stop)
+                    # Handle PrimValue conversion for shape elements
+                    end_val = shape[i] if index.stop is None else index.stop
+                    if isinstance(end_val, relax.expr.PrimValue):
+                        end_val = end_val.value
+                    stride_end.append(end_val)
                     stride.append(1 if index.step is None else index.step)
                     stride_axes.append(i)
                     i = i + 1
@@ -2540,7 +2621,11 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                 elif index is Ellipsis:
                     for _ in range(len(shape) - non_ellipsis_cnt):
                         stride_begin.append(0)
-                        stride_end.append(shape[i])
+                        # Handle PrimValue conversion for shape elements
+                        end_val = shape[i]
+                        if isinstance(end_val, relax.expr.PrimValue):
+                            end_val = end_val.value
+                        stride_end.append(end_val)
                         stride.append(1)
                         stride_axes.append(i)
                         i += 1
@@ -2557,7 +2642,11 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
                     raise ValueError("Unsupported index type: " + str(type(index)))
             while i < len(shape):
                 stride_begin.append(0)
-                stride_end.append(shape[i])
+                # Handle PrimValue conversion for shape elements
+                end_val = shape[i]
+                if isinstance(end_val, relax.expr.PrimValue):
+                    end_val = end_val.value
+                stride_end.append(end_val)
                 stride.append(1)
                 stride_axes.append(i)
                 i += 1

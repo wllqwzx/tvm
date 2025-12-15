@@ -914,23 +914,38 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         return self.block_builder.emit(relax.op.take(x, index, dim))
 
     def _slice(self, node: fx.Node) -> relax.Var:
-        import sys
+        import numpy as np
 
         x = self.env[node.args[0]]
-        dim = node.args[1] if len(node.args) > 1 else 0
-        start = node.args[2] if len(node.args) > 2 else None
-        end_val = node.args[3] if len(node.args) > 3 else None
-        step = node.args[4] if len(node.args) > 4 else 1
+        axes = [node.args[1]]
+        begin_raw = self._retrieve_args(node.args[2])
+        end_raw = self._retrieve_args(node.args[3])
+        stride = [self._retrieve_args(node.args[4]) if len(node.args) > 4 else 1]
+        # TODO: Should have better solution for symbolic slice
 
-        if start is None:
-            start = 0
-        if end_val is None:
-            end_val = sys.maxsize
+        # Get tensor shape info for the axis
+        axis = axes[0]
+        x_shape = self.shape_of(x)
+        if axis < 0:
+            axis += len(x_shape)
+        axis_shape = x_shape[axis]
 
-        axes = [dim]
-        begin = [start]
-        end = [end_val]
-        stride = [step]
+        # Process begin - use as-is
+        begin = [begin_raw]
+
+        # Process end - handle int64 max values and check if axis is symbolic
+        if end_raw == np.iinfo(np.int64).max:
+            # Check if the axis dimension is symbolic
+            if isinstance(axis_shape, (tvm.tir.SizeVar, tvm.tir.Var)):
+                # For symbolic shapes, use the symbolic dimension directly
+                end = [axis_shape]
+            else:
+                # For concrete shapes, use the actual size
+                end = [axis_shape]
+        else:
+            # Use the provided end value as-is
+            end = [end_raw]
+
         return self.block_builder.emit(relax.op.strided_slice(x, axes, begin, end, stride))
 
     def _unflatten(self, node: fx.Node) -> relax.Var:
@@ -1255,6 +1270,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "add.Tensor": self._binary_op(relax.op.add, operator.add),
             "add.Scalar": self._binary_op(relax.op.add, operator.add),
             "add_.Tensor": self._binary_op(relax.op.add, operator.add),
+            "add": self._binary_op(relax.op.add, operator.add),
             "bitwise_and.Tensor": self._binary_op(relax.op.bitwise_and, operator.and_),
             "bitwise_and.Scalar": self._binary_op(relax.op.bitwise_and, operator.and_),
             "bitwise_or_.Scalar": self._binary_op(relax.op.bitwise_or, operator.or_),
@@ -1426,6 +1442,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 relax.op.expand_dims(self.env[node.args[0]], node.args[1])
             ),
             "view.default": self._reshape,
+            "_unsafe_view.default": self._reshape,
             "reshape.default": self._reshape,
             "reshape_as.default": self._reshape_as,
             "as_strided.default": self._as_strided,
@@ -1576,9 +1593,37 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                         torch_dtype = node.meta["tensor_meta"].dtype
                         break
             elif spec.kind is torch.export.graph_signature.InputKind.BUFFER:
-                torch_shape = named_buffers[spec.target].shape
-                torch_dtype = named_buffers[spec.target].dtype
+                # Handle BUFFER type - check state_dict first, then constants
+                if spec.target in exported_program.state_dict:
+                    torch_shape = exported_program.state_dict[spec.target].shape
+                    torch_dtype = exported_program.state_dict[spec.target].dtype
+                elif spec.target in exported_program.constants:
+                    # Non-persistent buffers are stored in constants, like inv_freq in llm
+                    # See https://github.com/huggingface/transformers/pull/24998
+                    const_tensor = exported_program.constants[spec.target]
+                    torch_shape = const_tensor.shape
+                    torch_dtype = const_tensor.dtype
+                else:
+                    # Buffer not found in either state_dict or constants, check if it's used
+                    is_used = False
+                    for node in exported_program.graph.find_nodes(
+                        op="placeholder", target=spec.target
+                    ):
+                        if len(node.users) > 0:
+                            is_used = True
+                            break
+
+                    if not is_used:
+                        print(f"Skipping unused buffer: {spec.target}")
+                        continue
+                    else:
+                        raise ValueError(
+                            f"Used buffer {spec.target} not found in state_dict or constants"
+                        )
             elif spec.kind is torch.export.graph_signature.InputKind.PARAMETER:
+                # Handle PARAMETER type - must be in state_dict
+                if spec.target not in exported_program.state_dict:
+                    raise ValueError(f"Parameter {spec.target} not found in state_dict")
                 torch_shape = exported_program.state_dict[spec.target].shape
                 torch_dtype = exported_program.state_dict[spec.target].dtype
             else:
